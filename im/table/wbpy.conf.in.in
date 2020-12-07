@@ -13,13 +13,13 @@ AutoSelectLength=-1
 NoMatchAutoSelectLength=-1
 NoSortInputLength=2
 Hint=True
-MatchingKey=*
+MatchingKey=z
 OrderPolicy=Freq
 UseFullWidth=True
 QuickPhraseKey=semicolon
 AutoPhraseLength=4
 SaveAutoPhraseAfter=3
-AutoRuleSet=e2
+UseContextRelatedOrder=False
 
 [Table/PrevPage]
 0=Up

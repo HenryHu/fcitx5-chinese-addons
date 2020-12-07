@@ -1,25 +1,15 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 
 #include "pinyinhelper.h"
 #include <algorithm>
+#include <clipboard_public.h>
 #include <fcitx-config/iniparser.h>
+#include <fcitx-utils/event.h>
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/standardpath.h>
 #include <fcitx-utils/utf8.h>
@@ -27,6 +17,7 @@
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputmethodentry.h>
 #include <fcntl.h>
+#include <fmt/format.h>
 #include <set>
 
 namespace fcitx {
@@ -34,10 +25,75 @@ namespace fcitx {
 PinyinHelper::PinyinHelper(Instance *instance) : instance_(instance) {
     lookup_.load();
     stroke_.load();
-    reloadConfig();
+
+    // This is ok in the test.
+    if (!instance_) {
+        return;
+    }
+    deferEvent_ = instance_->eventLoop().addDeferEvent([this](EventSource *) {
+        initQuickPhrase();
+        return true;
+    });
 }
 
-void PinyinHelper::reloadConfig() {}
+void PinyinHelper::initQuickPhrase() {
+    if (!quickphrase()) {
+        return;
+    }
+    handler_ = quickphrase()->call<IQuickPhrase::addProvider>(
+        [this](InputContext *ic, const std::string &input,
+               const QuickPhraseAddCandidateCallback &callback) {
+            if (input != "duyin") {
+                return true;
+            }
+            std::vector<std::string> s;
+            if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+                if (auto selected = ic->surroundingText().selectedText();
+                    !selected.empty()) {
+                    s.push_back(std::move(selected));
+                }
+            }
+            if (clipboard()) {
+                if (s.empty()) {
+                    auto primary = clipboard()->call<IClipboard::primary>(ic);
+                    if (std::find(s.begin(), s.end(), primary) == s.end()) {
+                        s.push_back(std::move(primary));
+                    }
+                }
+                auto clip = clipboard()->call<IClipboard::clipboard>(ic);
+                if (std::find(s.begin(), s.end(), clip) == s.end()) {
+                    s.push_back(std::move(clip));
+                }
+            }
+
+            if (s.empty()) {
+                return true;
+            }
+            for (const auto &str : s) {
+                if (!utf8::validate(str)) {
+                    continue;
+                }
+                // Hard limit to prevent do too much lookup.
+                constexpr int limit = 20;
+                int counter = 0;
+                for (auto c : utf8::MakeUTF8CharRange(str)) {
+                    auto result = lookup(c);
+                    if (!result.empty()) {
+                        auto py = stringutils::join(result, ", ");
+                        auto display = fmt::format(_("{0} ({1})"),
+                                                   utf8::UCS4ToUTF8(c), py);
+                        callback(display, display,
+                                 QuickPhraseAction::DoNothing);
+                    }
+                    if (counter >= limit) {
+                        break;
+                    }
+                    counter += 1;
+                }
+            }
+            return false;
+        });
+}
 
 std::vector<std::string> PinyinHelper::lookup(uint32_t chr) {
     return lookup_.lookup(chr);
@@ -72,12 +128,17 @@ PinyinHelper::lookupStroke(const std::string &input, int limit) {
     return {};
 }
 
+std::string PinyinHelper::reverseLookupStroke(const std::string &input) {
+    return stroke_.reverseLookup(input);
+}
+
 std::string PinyinHelper::prettyStrokeString(const std::string &input) {
     return stroke_.prettyString(input);
 }
 
 class PinyinHelperModuleFactory : public AddonFactory {
     AddonInstance *create(AddonManager *manager) override {
+        registerDomain("fcitx5-chinese-addons", FCITX_INSTALL_LOCALEDIR);
         return new PinyinHelper(manager->instance());
     }
 };

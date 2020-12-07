@@ -1,23 +1,10 @@
-//
-// Copyright (C) 2012~2012 by Yichao Yu
-// yyc1992@gmail.com
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2012-2012 Yichao Yu <yyc1992@gmail.com>
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "pinyinlookup.h"
 
 #include <fcitx-utils/log.h>
@@ -79,8 +66,9 @@ std::string_view py_enhance_get_vokal(int index, int tone) {
     if (index < 0 || index >= vokals_count) {
         return "";
     }
-    if (tone < 0 || tone > 4)
+    if (tone < 0 || tone > 4) {
         tone = 0;
+    }
     return vokals_table[index][tone];
 }
 
@@ -155,8 +143,9 @@ bool PinyinLookup::load() {
         if (read(file.fd(), &count, 1) != 1) {
             return false;
         }
-        if (count == 0)
+        if (count == 0) {
             continue;
+        }
         auto &data = data_[chr];
         while (count--) {
             uint8_t buf[3];

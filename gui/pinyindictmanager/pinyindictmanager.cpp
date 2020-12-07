@@ -1,27 +1,15 @@
-//
-// Copyright (C) 2018~2018 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2018-2018 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "pinyindictmanager.h"
-#include "browserdialog.h"
-#include "filedownloader.h"
+#include "config.h"
 #include "log.h"
 #include "processrunner.h"
 #include "renamefile.h"
+#include <QDesktopServices>
 #include <QFileDialog>
 #include <QInputDialog>
 #include <QMenu>
@@ -29,6 +17,11 @@
 #include <QTemporaryFile>
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/standardpath.h>
+
+#ifdef ENABLE_BROWSER
+#include "browserdialog.h"
+#include "filedownloader.h"
+#endif
 
 namespace fcitx {
 
@@ -78,11 +71,21 @@ PinyinDictManager::PinyinDictManager(QWidget *parent)
     });
 
     model_->loadFileList();
+    connect(model_, &FileListModel::changed, this, [this]() { changed(true); });
 }
 
 void PinyinDictManager::load() {}
 
-void PinyinDictManager::save() {}
+void PinyinDictManager::save() {
+    QMetaObject::invokeMethod(
+        this,
+        [this]() {
+            model_->save();
+            emit changed(false);
+            emit saveFinished();
+        },
+        Qt::QueuedConnection);
+}
 
 QString PinyinDictManager::title() { return _("Pinyin dictionary manager"); }
 
@@ -181,10 +184,10 @@ void PinyinDictManager::importFromFile() {
 
     setEnabled(false);
     pipeline_->reset();
-    auto runner = new ProcessRunner(
-        "libime_pinyindict", QStringList() << info.fileName() << tempFile,
+    auto *runner = new ProcessRunner(
+        "libime_pinyindict", QStringList() << info.filePath() << tempFile,
         tempFile);
-    auto rename = new RenameFile(tempFile, fullname);
+    auto *rename = new RenameFile(tempFile, fullname);
     pipeline_->addJob(runner);
     pipeline_->addJob(rename);
     pipeline_->start();
@@ -240,19 +243,20 @@ void PinyinDictManager::importFromSogou() {
 
     setEnabled(false);
     pipeline_->reset();
-    auto scelrunner = new ProcessRunner(
+    auto *scelrunner = new ProcessRunner(
         "scel2org5",
         QStringList() << info.absoluteFilePath() << "-o" << txtFile, txtFile);
     pipeline_->addJob(scelrunner);
-    auto dictrunner = new ProcessRunner(
+    auto *dictrunner = new ProcessRunner(
         "libime_pinyindict", QStringList() << txtFile << tempFile, tempFile);
     pipeline_->addJob(dictrunner);
-    auto rename = new RenameFile(tempFile, fullname);
+    auto *rename = new RenameFile(tempFile, fullname);
     pipeline_->addJob(rename);
     pipeline_->start();
 }
 
 void PinyinDictManager::importFromSogouOnline() {
+#ifdef ENABLE_BROWSER
     BrowserDialog dialog(this);
     int result = dialog.exec();
     if (result != QDialog::Accepted) {
@@ -305,17 +309,20 @@ void PinyinDictManager::importFromSogouOnline() {
 
     setEnabled(false);
     pipeline_->reset();
-    auto fileDownloader = new FileDownloader(dialog.url(), scelFile);
+    auto *fileDownloader = new FileDownloader(dialog.url(), scelFile);
     pipeline_->addJob(fileDownloader);
-    auto scelrunner = new ProcessRunner(
+    auto *scelrunner = new ProcessRunner(
         "scel2org5", QStringList() << scelFile << "-o" << txtFile, txtFile);
     pipeline_->addJob(scelrunner);
-    auto dictrunner = new ProcessRunner(
+    auto *dictrunner = new ProcessRunner(
         "libime_pinyindict", QStringList() << txtFile << tempFile, tempFile);
     pipeline_->addJob(dictrunner);
-    auto rename = new RenameFile(tempFile, fullname);
+    auto *rename = new RenameFile(tempFile, fullname);
     pipeline_->addJob(rename);
     pipeline_->start();
+#else
+    QDesktopServices::openUrl(QUrl("https://pinyin.sogou.com/dict/"));
+#endif
 }
 
 void PinyinDictManager::removeAllDict() {

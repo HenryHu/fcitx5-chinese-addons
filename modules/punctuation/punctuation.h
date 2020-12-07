@@ -1,27 +1,16 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #ifndef _PUNCTUATION_PUNCTUATION_H_
 #define _PUNCTUATION_PUNCTUATION_H_
 
 #include "punctuation_public.h"
 #include <fcitx-config/configuration.h>
 #include <fcitx-config/enum.h>
+#include <fcitx-config/iniparser.h>
 #include <fcitx-utils/i18n.h>
 #include <fcitx/action.h>
 #include <fcitx/addonfactory.h>
@@ -34,7 +23,13 @@ FCITX_CONFIGURATION(
     PunctuationConfig,
     fcitx::Option<fcitx::KeyList> hotkey{
         this, "Hotkey", _("Toggle key"), {fcitx::Key("Control+period")}};
-    fcitx::Option<bool> enabled{this, "Enabled", "Enabled", true};);
+    fcitx::Option<bool> halfWidthPuncAfterLatinOrNumber{
+        this, "HalfWidthPuncAfterLetterOrNumber",
+        _("Half width punctuation after latin letter or number"), true};
+    fcitx::Option<bool> typePairedPunctuationTogether{
+        this, "TypePairedPunctuationsTogether",
+        _("Type paired punctuations together (e.g. Quote)"), false};
+    fcitx::HiddenOption<bool> enabled{this, "Enabled", "Enabled", true};);
 
 class PunctuationProfile {
 public:
@@ -87,13 +82,27 @@ public:
     const std::string &pushPunctuation(const std::string &language,
                                        fcitx::InputContext *ic,
                                        uint32_t unicode);
+    std::pair<std::string, std::string>
+    pushPunctuationV2(const std::string &language, fcitx::InputContext *ic,
+                      uint32_t unicode);
     const std::string &cancelLast(const std::string &language,
                                   fcitx::InputContext *ic);
 
     void reloadConfig() override;
+    void save() override {
+        fcitx::safeSaveAsIni(config_, "conf/punctuation.conf");
+    }
+    const fcitx::Configuration *getConfig() const override { return &config_; }
+    void setConfig(const fcitx::RawConfig &config) override {
+        config_.load(config, true);
+        fcitx::safeSaveAsIni(config_, "conf/punctuation.conf");
+        populateConfig();
+    }
+    void populateConfig();
 
     FCITX_ADDON_EXPORT_FUNCTION(Punctuation, getPunctuation);
     FCITX_ADDON_EXPORT_FUNCTION(Punctuation, pushPunctuation);
+    FCITX_ADDON_EXPORT_FUNCTION(Punctuation, pushPunctuationV2);
     FCITX_ADDON_EXPORT_FUNCTION(Punctuation, cancelLast);
 
     bool enabled() const { return *config_.enabled; }

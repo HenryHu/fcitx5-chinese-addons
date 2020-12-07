@@ -1,28 +1,16 @@
-//
-// Copyright (C) 2010~2018 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2010-2018 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 
 #include <codecvt>
 #include <cstring>
-#ifdef __FreeBSD__
-#include <sys/endian.h>
-#else
+#if defined(__linux__) || defined(__GLIBC__)
 #include <endian.h>
+#else
+#include <sys/endian.h>
 #endif
 #include <fcitx-utils/fs.h>
 #include <fcitx-utils/log.h>
@@ -67,7 +55,7 @@ std::string unicodeToUTF8(const char16_t *value, size_t size) {
 
 std::string unicodeToUTF8(const char *value, size_t size) {
     FCITX_ASSERT(size % 2 == 0) << "Invalid size of string";
-    auto ustr = reinterpret_cast<const uint16_t *>(value);
+    const auto *ustr = reinterpret_cast<const uint16_t *>(value);
     std::u16string str;
     str.reserve(size / 2);
     for (size_t i = 0; i < size / 2; i++) {

@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #ifndef _CLOUDPINYIN_CLOUDPINYIN_PUBLIC_H_
 #define _CLOUDPINYIN_CLOUDPINYIN_PUBLIC_H_
 
@@ -53,14 +41,14 @@ public:
                              fcitx::InputContext *inputContext,
                              CloudPinyinSelectedCallback callback)
         : CandidateWord(fcitx::Text{}), selectedSentence_(selectedSentence),
-          inputContext_(inputContext), callback_(callback) {
+          inputContext_(inputContext), callback_(std::move(callback)) {
         // use cloud unicode char
         setText(fcitx::Text("\xe2\x98\x81"));
         auto ref = watch();
         cloudpinyin_->call<fcitx::ICloudPinyin::request>(
             pinyin, [ref](const std::string &pinyin, const std::string &hanzi) {
                 FCITX_UNUSED(pinyin);
-                auto self = ref.get();
+                auto *self = ref.get();
                 if (self) {
                     self->fill(hanzi);
                 }
@@ -92,12 +80,12 @@ private:
     }
 
     void update() {
-        auto inputContext = inputContext_;
+        auto *inputContext = inputContext_;
         auto candidateList = inputContext_->inputPanel().candidateList();
         if (!candidateList) {
             return;
         }
-        auto modifiable = candidateList->toModifiable();
+        auto *modifiable = candidateList->toModifiable();
         if (!modifiable) {
             return;
         }
@@ -105,7 +93,7 @@ private:
         int idx = -1;
         bool dup = false;
         for (auto i = 0, e = modifiable->totalSize(); i < e; i++) {
-            auto &candidate = modifiable->candidateFromAll(i);
+            const auto &candidate = modifiable->candidateFromAll(i);
             if (static_cast<CandidateWord *>(this) == &candidate) {
                 idx = i;
             } else {

@@ -1,31 +1,21 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 
 #include "pinyin.h"
 #include "cloudpinyin_public.h"
 #include "config.h"
+#ifdef FCITX_HAS_LUA
+#include "luaaddon_public.h"
+#endif
 #include "notifications_public.h"
 #include "pinyinhelper_public.h"
 #include "punctuation_public.h"
 #include "spell_public.h"
 #include <boost/algorithm/string.hpp>
-#include <boost/format.hpp>
 #include <boost/iostreams/device/file_descriptor.hpp>
 #include <boost/iostreams/stream.hpp>
 #include <fcitx-config/iniparser.h>
@@ -49,6 +39,7 @@
 #include <libime/pinyin/pinyincontext.h>
 #include <libime/pinyin/pinyindecoder.h>
 #include <libime/pinyin/pinyindictionary.h>
+#include <libime/pinyin/pinyinencoder.h>
 #include <libime/pinyin/shuangpinprofile.h>
 #include <quickphrase_public.h>
 
@@ -67,15 +58,32 @@ bool consumePreifx(std::string_view &view, std::string_view prefix) {
     return false;
 }
 
+enum class PinyinMode { Normal, StrokeFilter, ForgetCandidate };
+
 class PinyinState : public InputContextProperty {
 public:
-    PinyinState(PinyinEngine *engine) : context_(engine->ime()) {}
+    PinyinState(PinyinEngine *engine) : context_(engine->ime()) {
+        context_.setMaxSentenceLength(35);
+    }
 
     libime::PinyinContext context_;
     bool lastIsPunc_ = false;
+
+    PinyinMode mode_ = PinyinMode::Normal;
+
+    // Stroke filter
+    std::shared_ptr<CandidateList> strokeCandidateList_;
+    InputBuffer strokeBuffer_;
+
+    // Forget candidate
+    std::shared_ptr<CandidateList> forgetCandidateList_;
+
     std::unique_ptr<EventSourceTime> cancelLastEvent_;
 
     std::vector<std::string> predictWords_;
+
+    int keyReleased_ = -1;
+    int keyReleasedIndex_ = -2;
 };
 
 class PinyinPredictCandidateWord : public CandidateWord {
@@ -85,7 +93,7 @@ public:
 
     void select(InputContext *inputContext) const override {
         inputContext->commitString(word_);
-        auto state = inputContext->propertyFor(&engine_->factory());
+        auto *state = inputContext->propertyFor(&engine_->factory());
         state->predictWords_.push_back(word_);
         // Max history size.
         constexpr size_t maxHistorySize = 5;
@@ -104,9 +112,9 @@ public:
 
 class StrokeCandidateWord : public CandidateWord {
 public:
-    StrokeCandidateWord(PinyinEngine *engine, const std::string &hz,
+    StrokeCandidateWord(PinyinEngine *engine, std::string hz,
                         const std::string &py)
-        : CandidateWord(), engine_(engine), hz_(std::move(hz)) {
+        : engine_(engine), hz_(std::move(hz)) {
         if (py.empty()) {
             setText(Text(hz_));
         } else {
@@ -124,15 +132,95 @@ private:
     std::string hz_;
 };
 
-class SpellCandidateWord : public CandidateWord {
+class StrokeFilterCandidateWord : public CandidateWord {
 public:
-    SpellCandidateWord(PinyinEngine *engine, const std::string &word)
-        : CandidateWord(), engine_(engine), word_(std::move(word)) {
+    StrokeFilterCandidateWord(PinyinEngine *engine, Text text, int index)
+        : engine_(engine), index_(index) {
+        setText(std::move(text));
+    }
+
+    void select(InputContext *inputContext) const override {
+        auto *state = inputContext->propertyFor(&engine_->factory());
+        if (!state->strokeCandidateList_ ||
+            state->strokeCandidateList_->toBulk()->totalSize() <= index_) {
+            FCITX_ERROR() << "Stroke candidate is not consistent. Probably a "
+                             "bug in implementation";
+            return;
+        }
+        // Forward the selection to internal candidate list.
+        state->strokeCandidateList_->toBulk()->candidateFromAll(index_).select(
+            inputContext);
+        engine_->resetStroke(inputContext);
+    }
+
+private:
+    PinyinEngine *engine_;
+    int index_;
+};
+
+class ForgetCandidateWord : public CandidateWord {
+public:
+    ForgetCandidateWord(PinyinEngine *engine, Text text, size_t index)
+        : engine_(engine), index_(index) {
+        setText(std::move(text));
+    }
+
+    void select(InputContext *inputContext) const override {
+        auto *state = inputContext->propertyFor(&engine_->factory());
+        if (state->mode_ != PinyinMode::ForgetCandidate) {
+            FCITX_ERROR() << "Candidate is not consistent. Probably a "
+                             "bug in implementation";
+            return;
+        }
+
+        if (index_ < state->context_.candidates().size()) {
+            const auto &sentence = state->context_.candidates()[index_];
+            // If this is a word, remove it from user dict.
+            if (sentence.size() == 1) {
+                auto py = state->context_.candidateFullPinyin(index_);
+                state->context_.ime()->dict()->removeWord(
+                    libime::PinyinDictionary::UserDict, py,
+                    sentence.toString());
+            }
+            for (const auto &word : sentence.sentence()) {
+                state->context_.ime()->model()->history().forget(word->word());
+            }
+        }
+        engine_->resetForgetCandidate(inputContext);
+        engine_->doReset(inputContext);
+    }
+
+private:
+    PinyinEngine *engine_;
+    size_t index_;
+};
+
+class ExtraCandidateWord : public CandidateWord {
+public:
+    ExtraCandidateWord(PinyinEngine *engine, std::string word)
+        : engine_(engine), word_(std::move(word)) {
         setText(Text(word_));
     }
 
     void select(InputContext *inputContext) const override {
-        auto state = inputContext->propertyFor(&engine_->factory());
+        inputContext->commitString(word_);
+        engine_->doReset(inputContext);
+    }
+
+private:
+    PinyinEngine *engine_;
+    std::string word_;
+};
+
+class SpellCandidateWord : public CandidateWord {
+public:
+    SpellCandidateWord(PinyinEngine *engine, std::string word)
+        : engine_(engine), word_(std::move(word)) {
+        setText(Text(word_));
+    }
+
+    void select(InputContext *inputContext) const override {
+        auto *state = inputContext->propertyFor(&engine_->factory());
         auto &context = state->context_;
         inputContext->commitString(context.selectedSentence() + word_);
         engine_->doReset(inputContext);
@@ -149,7 +237,7 @@ public:
         : CandidateWord(std::move(text)), engine_(engine), idx_(idx) {}
 
     void select(InputContext *inputContext) const override {
-        auto state = inputContext->propertyFor(&engine_->factory());
+        auto *state = inputContext->propertyFor(&engine_->factory());
         auto &context = state->context_;
         if (idx_ >= context.candidates().size()) {
             return;
@@ -173,14 +261,16 @@ PinyinEngine::predictCandidateList(const std::vector<std::string> &words) {
     }
     candidateList->setSelectionKey(selectionKeys_);
     candidateList->setPageSize(*config_.pageSize);
-    candidateList->setGlobalCursorIndex(0);
+    if (candidateList->size()) {
+        candidateList->setGlobalCursorIndex(0);
+    }
     return candidateList;
 }
 
 void PinyinEngine::initPredict(InputContext *inputContext) {
     inputContext->inputPanel().reset();
 
-    auto state = inputContext->propertyFor(&factory_);
+    auto *state = inputContext->propertyFor(&factory_);
     auto &context = state->context_;
     auto lmState = context.state();
     state->predictWords_ = context.selectedWords();
@@ -197,7 +287,7 @@ void PinyinEngine::initPredict(InputContext *inputContext) {
 void PinyinEngine::updatePredict(InputContext *inputContext) {
     inputContext->inputPanel().reset();
 
-    auto state = inputContext->propertyFor(&factory_);
+    auto *state = inputContext->propertyFor(&factory_);
     auto words = prediction_.predict(state->predictWords_, *config_.pageSize);
     if (auto candidateList = predictCandidateList(words)) {
         auto &inputPanel = inputContext->inputPanel();
@@ -214,13 +304,9 @@ int englishNess(const std::string &input, bool sp) {
     for (auto iter = pys.begin(), end = pys.end(); iter != end; ++iter) {
         if (sp) {
             if (iter->size() == 2) {
-                weight += fullWeight;
+                weight += fullWeight / 2;
             } else {
-                if (std::next(iter) == end) {
-                    weight += shortWeight;
-                } else {
-                    weight += invalidWeight;
-                }
+                weight += invalidWeight;
             }
         } else {
             if (*iter == "ng") {
@@ -229,8 +315,8 @@ int englishNess(const std::string &input, bool sp) {
                 auto firstChr = (*iter)[0];
                 if (firstChr == '\'') {
                     return 0;
-                } else if (firstChr == 'i' || firstChr == 'u' ||
-                           firstChr == 'v') {
+                }
+                if (firstChr == 'i' || firstChr == 'u' || firstChr == 'v') {
                     weight += invalidWeight;
                 } else if (iter->size() <= 2) {
                     weight += shortWeight;
@@ -246,7 +332,7 @@ int englishNess(const std::string &input, bool sp) {
     if (weight < 0) {
         return 0;
     }
-    return (weight + 3) / 10;
+    return (weight + 7) / 10;
 }
 
 bool isStroke(const std::string &input) {
@@ -255,16 +341,63 @@ bool isStroke(const std::string &input) {
                        [](char c) { return py.count(c); });
 }
 
+#ifdef FCITX_HAS_LUA
+std::vector<std::string>
+PinyinEngine::luaCandidateTrigger(InputContext *ic,
+                                  const std::string &candidateString) {
+    std::vector<std::string> result;
+    RawConfig arg;
+    arg.setValue(candidateString);
+    auto ret = imeapi()->call<ILuaAddon::invokeLuaFunction>(
+        ic, "candidateTrigger", arg);
+    const auto *length = ret.valueByPath("Length");
+    try {
+        if (length) {
+            auto n = std::stoi(*length);
+            for (int i = 0; i < n; i++) {
+                const auto *candidate = ret.valueByPath(std::to_string(i));
+                if (candidate && !candidate->empty()) {
+                    result.push_back(*candidate);
+                }
+            }
+        }
+    } catch (...) {
+    }
+    return result;
+}
+#endif
+
+bool PinyinEngine::showClientPreedit(InputContext *inputContext) const {
+    return config_.showPreeditInApplication.value() &&
+           inputContext->capabilityFlags().test(CapabilityFlag::Preedit);
+}
+
+Text PinyinEngine::fetchAndSetClientPreedit(
+    InputContext *inputContext, const libime::PinyinContext &context) const {
+    auto preeditWithCursor = context.preeditWithCursor();
+    Text preedit(std::move(preeditWithCursor.first));
+    preedit.setCursor(preeditWithCursor.second);
+    auto &inputPanel = inputContext->inputPanel();
+    if (showClientPreedit(inputContext)) {
+        inputPanel.setClientPreedit(preedit);
+    } else {
+        inputPanel.setClientPreedit(
+            Text(context.sentence(), TextFormatFlag::Underline));
+    }
+    return preedit;
+}
+
 void PinyinEngine::updateUI(InputContext *inputContext) {
     inputContext->inputPanel().reset();
 
-    auto state = inputContext->propertyFor(&factory_);
-    auto &context = state->context_;
+    auto *state = inputContext->propertyFor(&factory_);
+    // Use const ref to avoid accidentally change anything.
+    const auto &context = state->context_;
     if (context.selected()) {
         auto sentence = context.sentence();
         if (!inputContext->capabilityFlags().testAny(
                 CapabilityFlag::PasswordOrSensitive)) {
-            context.learn();
+            state->context_.learn();
         }
         inputContext->updatePreedit();
         inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
@@ -272,122 +405,167 @@ void PinyinEngine::updateUI(InputContext *inputContext) {
         if (*config_.predictionEnabled) {
             initPredict(inputContext);
         }
-        context.clear();
+        state->context_.clear();
         return;
     }
 
-    if (context.userInput().size()) {
-        auto &candidates = context.candidates();
+    do {
+        if (context.userInput().empty()) {
+            break;
+        }
+        // Update Preedit.
         auto &inputPanel = inputContext->inputPanel();
-        if (context.candidates().size()) {
-            auto candidateList = std::make_unique<CommonCandidateList>();
-            size_t idx = 0;
-            candidateList->setPageSize(*config_.pageSize);
-            candidateList->setCursorPositionAfterPaging(
-                CursorPositionAfterPaging::ResetToFirst);
+        Text preedit = fetchAndSetClientPreedit(inputContext, state->context_);
+        if (!showClientPreedit(inputContext)) {
+            inputPanel.setPreedit(preedit);
+        }
+        // Update candidate
+        const auto &candidates = context.candidates();
+        if (candidates.empty()) {
+            break;
+        }
 
-            std::unique_ptr<CloudPinyinCandidateWord> cloud;
-            if (*config_.cloudPinyinEnabled && cloudpinyin() &&
-                !inputContext->capabilityFlags().testAny(
-                    CapabilityFlag::PasswordOrSensitive)) {
-                using namespace std::placeholders;
-                auto fullPinyin =
-                    context.useShuangpin()
-                        ? context.candidateFullPinyin(0)
-                        : context.userInput().substr(context.selectedLength());
-                cloud = std::make_unique<CloudPinyinCandidateWord>(
-                    cloudpinyin(), fullPinyin, context.selectedSentence(),
-                    inputContext,
-                    std::bind(&PinyinEngine::cloudPinyinSelected, this, _1, _2,
-                              _3));
+        // Setup candidate list.
+        auto candidateList = std::make_unique<CommonCandidateList>();
+        candidateList->setPageSize(*config_.pageSize);
+        candidateList->setCursorPositionAfterPaging(
+            CursorPositionAfterPaging::ResetToFirst);
+
+        // Precompute some values.
+        const auto selectedLength = context.selectedLength();
+        const auto selectedSentence = context.selectedSentence();
+
+        /// Create cloud candidate. {{{
+        std::unique_ptr<CloudPinyinCandidateWord> cloud;
+        if (*config_.cloudPinyinEnabled && cloudpinyin() &&
+            !inputContext->capabilityFlags().testAny(
+                CapabilityFlag::PasswordOrSensitive)) {
+            using namespace std::placeholders;
+            auto fullPinyin = context.useShuangpin()
+                                  ? context.candidateFullPinyin(0)
+                                  : context.userInput().substr(selectedLength);
+            cloud = std::make_unique<CloudPinyinCandidateWord>(
+                cloudpinyin(), fullPinyin, selectedSentence, inputContext,
+                std::bind(&PinyinEngine::cloudPinyinSelected, this, _1, _2,
+                          _3));
+        }
+        /// }}}
+
+        /// Create spell candidate {{{
+        int engNess;
+        auto parsedPy =
+            state->context_.preedit(libime::PinyinPreeditMode::RawText);
+        std::vector<std::unique_ptr<SpellCandidateWord>> spellCands;
+        if (*config_.spellEnabled && spell() &&
+            (engNess = englishNess(parsedPy, context.useShuangpin()))) {
+            auto py = context.userInput().substr(selectedLength);
+            auto results = spell()->call<ISpell::hintWithProvider>(
+                "en", SpellProvider::Custom, py, engNess);
+            spellCands.reserve(results.size());
+            std::string bestSentence;
+            if (!candidates.empty()) {
+                bestSentence = candidates[0].toString();
             }
-            for (const auto &candidate : candidates) {
-                auto candidateString = candidate.toString();
-                if (cloud && cloud->filled() &&
-                    cloud->word() == candidateString) {
+            for (auto &result : results) {
+                if (cloud && cloud->filled() && cloud->word() == result) {
                     cloud.reset();
                 }
-                candidateList->append<PinyinCandidateWord>(
-                    this, Text(std::move(candidateString)), idx);
-                idx++;
+                // Pinyin can only return eng when there is no valid option.
+                if (result == bestSentence) {
+                    continue;
+                }
+                spellCands.push_back(
+                    std::make_unique<SpellCandidateWord>(this, result));
             }
-            int engNess;
-            auto parsedPy =
-                context.preedit().substr(context.selectedSentence().size());
-            if (spell() &&
-                (engNess = englishNess(parsedPy, context.useShuangpin()))) {
-                auto py = context.userInput().substr(context.selectedLength());
-                auto results = spell()->call<ISpell::hintWithProvider>(
-                    "en", SpellProvider::Custom, py, engNess);
-                int idx = 1;
-                for (auto &result : results) {
-                    auto actualIdx = idx;
-                    if (actualIdx > candidateList->totalSize()) {
-                        actualIdx = candidateList->totalSize();
-                    }
-                    if (cloud && cloud->filled() && cloud->word() == result) {
-                        cloud.reset();
-                    }
+        }
+        /// }}}
 
-                    candidateList->insert(
-                        actualIdx,
-                        std::make_unique<SpellCandidateWord>(this, result));
-                    idx++;
-                }
+        /// Create stroke candidate {{{
+        std::vector<std::unique_ptr<StrokeCandidateWord>> strokeCands;
+        if (pinyinhelper() && context.selectedLength() == 0 &&
+            isStroke(context.userInput())) {
+            int limit = (context.userInput().size() + 4) / 5;
+            if (limit > 3) {
+                limit = 3;
             }
-            // if we didn't got it from cache or whatever, and not empty
-            // otherwise we can throw it away.
-            if (cloud && (!cloud->filled() || !cloud->word().empty())) {
-                auto index = *config_.cloudPinyinIndex;
-                if (index >= candidateList->totalSize()) {
-                    index = candidateList->totalSize();
-                }
-                candidateList->insert(index - 1, std::move(cloud));
+            auto results = pinyinhelper()->call<IPinyinHelper::lookupStroke>(
+                context.userInput(), limit);
+            for (auto &result : results) {
+                utf8::getChar(result.first);
+                auto py = pinyinhelper()->call<IPinyinHelper::lookup>(
+                    utf8::getChar(result.first));
+                auto pystr = stringutils::join(py, " ");
+                strokeCands.push_back(std::make_unique<StrokeCandidateWord>(
+                    this, result.first, pystr));
             }
-            if (pinyinhelper() && context.selectedLength() == 0 &&
-                isStroke(context.userInput())) {
-                int limit = (context.userInput().size() + 4) / 5;
-                if (limit > 3) {
-                    limit = 3;
+        }
+        /// }}}
+
+        size_t idx = 0;
+        for (const auto &candidate : candidates) {
+            auto candidateString = candidate.toString();
+            std::vector<std::string> extraCandidates;
+#ifdef FCITX_HAS_LUA
+            // To invoke lua trigger, we need "raw full sentence". Also, check
+            // against nbest, otherwise single char may be invoked for too much
+            // times.
+            if (selectedLength == 0 &&
+                static_cast<int>(idx) <
+                    std::max(*config_.nbest, *config_.pageSize) &&
+                imeapi() &&
+                candidate.sentence().back()->to()->index() ==
+                    context.userInput().size()) {
+                extraCandidates =
+                    luaCandidateTrigger(inputContext, candidateString);
+            }
+#endif
+            if (cloud && cloud->filled() && cloud->word() == candidateString) {
+                cloud.reset();
+            }
+            candidateList->append<PinyinCandidateWord>(
+                this, Text(std::move(candidateString)), idx);
+            for (auto &extraCandidate : extraCandidates) {
+                candidateList->append<ExtraCandidateWord>(this, extraCandidate);
+            }
+            idx++;
+            // We don't want to do too much comparision for cloud pinyin.
+            if (cloud && (!cloud->filled() || !cloud->word().empty()) &&
+                (static_cast<int>(idx) >
+                     std::max(*config_.nbest, *config_.cloudPinyinIndex - 1) ||
+                 idx == candidates.size())) {
+                auto desiredPos = *config_.cloudPinyinIndex - 1;
+                if (desiredPos > candidateList->totalSize()) {
+                    desiredPos = candidateList->totalSize();
                 }
-                auto results =
-                    pinyinhelper()->call<IPinyinHelper::lookupStroke>(
-                        context.userInput(), limit);
+                candidateList->insert(desiredPos, std::move(cloud));
+            }
+            if (!spellCands.empty() && (idx == 1 || idx == candidates.size())) {
+                for (auto &spellCand : spellCands) {
+                    candidateList->append(std::move(spellCand));
+                }
+                spellCands.clear();
+            }
+            if (!strokeCands.empty() &&
+                (candidateList->totalSize() + 1 >= *config_.pageSize ||
+                 idx == candidates.size())) {
                 int desiredPos =
-                    *config_.pageSize - static_cast<int>(results.size());
-                if (desiredPos < 0) {
-                    desiredPos = 0;
+                    *config_.pageSize - static_cast<int>(strokeCands.size());
+                if (desiredPos < 0 || desiredPos > candidateList->totalSize()) {
+                    desiredPos = candidateList->totalSize();
                 }
-                for (auto &result : results) {
-                    utf8::getChar(result.first);
-                    auto py = pinyinhelper()->call<IPinyinHelper::lookup>(
-                        utf8::getChar(result.first));
-                    auto pystr = stringutils::join(py, " ");
-
-                    if (desiredPos > candidateList->size()) {
-                        desiredPos = candidateList->size();
-                    }
-                    candidateList->insert(desiredPos,
-                                          std::make_unique<StrokeCandidateWord>(
-                                              this, result.first, pystr));
+                for (auto &strokeCand : strokeCands) {
+                    candidateList->insert(desiredPos, std::move(strokeCand));
+                    desiredPos += 1;
                 }
+                strokeCands.clear();
             }
-            candidateList->setSelectionKey(selectionKeys_);
+        }
+        candidateList->setSelectionKey(selectionKeys_);
+        if (candidateList->size()) {
             candidateList->setGlobalCursorIndex(0);
-            inputPanel.setCandidateList(std::move(candidateList));
         }
-        auto preeditWithCursor = context.preeditWithCursor();
-        Text preedit(preeditWithCursor.first);
-        preedit.setCursor(preeditWithCursor.second);
-        if (config_.showPreeditInApplication.value() &&
-            inputContext->capabilityFlags().test(CapabilityFlag::Preedit)) {
-            inputPanel.setClientPreedit(preedit);
-        } else {
-            inputPanel.setPreedit(preedit);
-            inputPanel.setClientPreedit(
-                Text(context.sentence(), TextFormatFlag::Underline));
-        }
-    }
+        inputPanel.setCandidateList(std::move(candidateList));
+    } while (0);
     inputContext->updatePreedit();
     inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
 }
@@ -405,7 +583,7 @@ PinyinEngine::PinyinEngine(Instance *instance)
                        libime::PinyinDictFormat::Binary);
     prediction_.setUserLanguageModel(ime_->model());
 
-    auto &standardPath = StandardPath::global();
+    const auto &standardPath = StandardPath::global();
     do {
         auto file = standardPath.openUser(StandardPath::Type::PkgData,
                                           "pinyin/user.dict", O_RDONLY);
@@ -470,41 +648,116 @@ PinyinEngine::PinyinEngine(Instance *instance)
         });
     instance_->userInterfaceManager().registerAction("pinyin-prediction",
                                                      &predictionAction_);
+    event_ = instance_->watchEvent(
+        EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
+        [this](Event &event) {
+            auto &keyEvent = static_cast<KeyEvent &>(event);
+            auto *inputContext = keyEvent.inputContext();
+            auto *entry = instance_->inputMethodEntry(inputContext);
+            if (!entry || entry->addon() != "pinyin") {
+                return;
+            }
+            handle2nd3rdSelection(keyEvent);
+        });
 }
 
 PinyinEngine::~PinyinEngine() {}
 
+void PinyinEngine::loadDict(const StandardPathFile &file) {
+    if (file.fd() < 0) {
+        return;
+    }
+    try {
+        boost::iostreams::stream_buffer<
+            boost::iostreams::file_descriptor_source>
+            buffer(file.fd(),
+                   boost::iostreams::file_descriptor_flags::never_close_handle);
+        std::istream in(&buffer);
+        ime_->dict()->addEmptyDict();
+        ime_->dict()->load(ime_->dict()->dictSize() - 1, in,
+                           libime::PinyinDictFormat::Binary);
+    } catch (const std::exception &e) {
+        PINYIN_ERROR() << "Failed to load pinyin dict " << file.path() << ": "
+                       << e.what();
+    }
+}
+
 void PinyinEngine::loadExtraDict() {
-    auto &standardPath = StandardPath::global();
+    const auto &standardPath = StandardPath::global();
     auto files = standardPath.multiOpen(StandardPath::Type::PkgData,
                                         "pinyin/dictionaries", O_RDONLY,
                                         filter::Suffix(".dict"));
+    auto disableFiles = standardPath.multiOpen(StandardPath::Type::PkgData,
+                                               "pinyin/dictionaries", O_RDONLY,
+                                               filter::Suffix(".dict.disable"));
     ime_->dict()->removeAll();
+    if (*config_.emojiEnabled) {
+        auto file = standardPath.open(StandardPath::Type::PkgData,
+                                      "pinyin/emoji.dict", O_RDONLY);
+        loadDict(file);
+    }
+    if (*config_.chaiziEnabled) {
+        auto file = standardPath.open(StandardPath::Type::PkgData,
+                                      "pinyin/chaizi.dict", O_RDONLY);
+        loadDict(file);
+        ime_->dict()->setFlags(ime_->dict()->dictSize() - 1,
+                               libime::PinyinDictFlag::FullMatch);
+    }
     for (const auto &file : files) {
-        try {
-            if (file.second.fd() < 0) {
-                continue;
-            }
-            PINYIN_DEBUG() << "Loading extra dictionary: " << file.first;
-            boost::iostreams::stream_buffer<
-                boost::iostreams::file_descriptor_source>
-                buffer(file.second.fd(),
-                       boost::iostreams::file_descriptor_flags::
-                           never_close_handle);
-            std::istream in(&buffer);
-            ime_->dict()->addEmptyDict();
-            ime_->dict()->load(ime_->dict()->dictSize() - 1, in,
-                               libime::PinyinDictFormat::Binary);
-        } catch (const std::exception &e) {
-            PINYIN_ERROR() << "Failed to load pinyin dict " << file.first
-                           << ": " << e.what();
+        if (disableFiles.count(stringutils::concat(file.first, ".disable"))) {
+            PINYIN_DEBUG() << "Dictionary: " << file.first << " is disabled.";
+            continue;
         }
+        PINYIN_DEBUG() << "Loading extra dictionary: " << file.first;
+        loadDict(file.second);
     }
 }
 
 void PinyinEngine::reloadConfig() {
+    PINYIN_DEBUG() << "Reload pinyin config.";
     readAsIni(config_, "conf/pinyin.conf");
+    if (*config_.firstRun) {
+        config_.firstRun.setValue(false);
+        safeSaveAsIni(config_, "conf/pinyin.conf");
+        deferEvent_ = instance_->eventLoop().addDeferEvent([this](
+                                                               EventSource *) {
+            if (cloudpinyin() && !*config_.cloudPinyinEnabled) {
+                auto key = cloudpinyin()->call<ICloudPinyin::toggleKey>();
+
+                std::string msg;
+                if (key.empty()) {
+                    msg = _("Do you want to enable cloudpinyin now for better "
+                            "prediction? You can always toggle it later in "
+                            "configuration.");
+                } else {
+                    msg = fmt::format(
+                        _("Do you want to enable cloudpinyin now for better "
+                          "prediction? You can always toggle it later in "
+                          "configuration or by pressing {}."),
+                        Key::keyListToString(key, KeyStringFormat::Localized));
+                }
+                std::vector<std::string> actions = {"yes", _("Yes"), "no",
+                                                    _("No")};
+
+                notifications()->call<INotifications::sendNotification>(
+                    _("Pinyin"), 0, "fcitx-pinyin", _("Enable Cloudpinyin"),
+                    msg, actions, -1,
+                    [this](const std::string &action) {
+                        if (action == "yes") {
+                            config_.cloudPinyinEnabled.setValue(true);
+                            save();
+                        }
+                    },
+                    nullptr);
+            }
+            return true;
+        });
+    }
     ime_->setNBest(*config_.nbest);
+    ime_->setPartialLongWordLimit(*config_.longWordLimit);
+    ime_->setPreeditMode(*config_.showActualPinyinInPreedit
+                             ? libime::PinyinPreeditMode::Pinyin
+                             : libime::PinyinPreeditMode::RawText);
     if (*config_.shuangpinProfile == ShuangpinProfileEnum::Custom) {
         auto file = StandardPath::global().open(StandardPath::Type::PkgConfig,
                                                 "pinyin/sp.dat", O_RDONLY);
@@ -549,6 +802,8 @@ void PinyinEngine::reloadConfig() {
     SET_FUZZY_FLAG(ue, VE_UE)
     SET_FUZZY_FLAG(ng, NG_GN)
     SET_FUZZY_FLAG(inner, Inner)
+    SET_FUZZY_FLAG(innerShort, InnerShort)
+    SET_FUZZY_FLAG(partialFinal, PartialFinal)
     SET_FUZZY_FLAG(v, V_U)
     SET_FUZZY_FLAG(an, AN_ANG)
     SET_FUZZY_FLAG(en, EN_ENG)
@@ -564,16 +819,44 @@ void PinyinEngine::reloadConfig() {
 
     ime_->setFuzzyFlags(flags);
 
+    quickphraseTriggerDict_.clear();
+    for (std::string_view prefix : *config_.quickphraseTrigger) {
+        if (prefix.empty()) {
+            continue;
+        }
+        auto length = utf8::lengthValidated(prefix);
+        if (length == utf8::INVALID_LENGTH || length < 1) {
+            continue;
+        }
+        auto latinPartLength =
+            utf8::ncharByteLength(prefix.begin(), length - 1);
+        auto latinPart = prefix.substr(0, latinPartLength);
+
+        if (std::any_of(latinPart.begin(), latinPart.end(), [](char c) {
+                return !charutils::islower(c) && !charutils::isupper(c);
+            })) {
+            continue;
+        }
+
+        const uint32_t trigger =
+            utf8::getChar(prefix.begin() + latinPartLength, prefix.end());
+        if (trigger && trigger != utf8::INVALID_CHAR &&
+            trigger != utf8::NOT_ENOUGH_SPACE) {
+            quickphraseTriggerDict_[std::string(latinPart)].insert(trigger);
+        }
+    }
+    PINYIN_DEBUG() << "Quick Phrase Trigger Dict: " << quickphraseTriggerDict_;
+
     loadExtraDict();
 }
 void PinyinEngine::activate(const fcitx::InputMethodEntry &entry,
                             fcitx::InputContextEvent &event) {
-    auto inputContext = event.inputContext();
+    auto *inputContext = event.inputContext();
     // Request full width.
     fullwidth();
     chttrans();
-    for (auto actionName : {"chttrans", "punctuation", "fullwidth"}) {
-        if (auto action =
+    for (const auto *actionName : {"chttrans", "punctuation", "fullwidth"}) {
+        if (auto *action =
                 instance_->userInterfaceManager().lookupAction(actionName)) {
             inputContext->statusArea().addAction(StatusGroup::InputMethod,
                                                  action);
@@ -581,27 +864,475 @@ void PinyinEngine::activate(const fcitx::InputMethodEntry &entry,
     }
     inputContext->statusArea().addAction(StatusGroup::InputMethod,
                                          &predictionAction_);
-    auto state = inputContext->propertyFor(&factory_);
+    auto *state = inputContext->propertyFor(&factory_);
     state->context_.setUseShuangpin(entry.uniqueName() == "shuangpin");
 }
 
 void PinyinEngine::deactivate(const fcitx::InputMethodEntry &entry,
                               fcitx::InputContextEvent &event) {
-    auto inputContext = event.inputContext();
-    inputContext->statusArea().clearGroup(StatusGroup::InputMethod);
+    auto *inputContext = event.inputContext();
     if (event.type() == EventType::InputContextSwitchInputMethod) {
-        auto state = inputContext->propertyFor(&factory_);
-        if (state->context_.size()) {
+        auto *state = inputContext->propertyFor(&factory_);
+        if (!state->context_.empty()) {
             inputContext->commitString(state->context_.userInput());
         }
     }
     reset(entry, event);
 }
 
+bool PinyinEngine::handleCloudpinyinTrigger(KeyEvent &event) {
+    if (cloudpinyin() && event.key().checkKeyList(
+                             cloudpinyin()->call<ICloudPinyin::toggleKey>())) {
+        config_.cloudPinyinEnabled.setValue(!*config_.cloudPinyinEnabled);
+        safeSaveAsIni(config_, "conf/pinyin.conf");
+
+        if (notifications()) {
+            notifications()->call<INotifications::showTip>(
+                "fcitx-cloudpinyin-toggle", _("Pinyin"), "",
+                _("Cloud Pinyin Status"),
+                *config_.cloudPinyinEnabled ? _("Cloud Pinyin is enabled.")
+                                            : _("Cloud Pinyin is disabled."),
+                -1);
+        }
+        if (*config_.cloudPinyinEnabled) {
+            cloudpinyin()->call<ICloudPinyin::resetError>();
+        }
+        event.filterAndAccept();
+        return true;
+    }
+    return false;
+}
+
+bool PinyinEngine::handle2nd3rdSelection(KeyEvent &event) {
+    auto *inputContext = event.inputContext();
+    auto candidateList = inputContext->inputPanel().candidateList();
+    if (!candidateList) {
+        return false;
+    }
+
+    struct {
+        const KeyList &list;
+        int selection;
+    } keyHandlers[] = {
+        // Index starts with 0
+        {*config_.secondCandidate, 1},
+        {*config_.thirdCandidate, 2},
+    };
+
+    auto *state = inputContext->propertyFor(&factory_);
+    int keyReleased = state->keyReleased_;
+    int keyReleasedIndex = state->keyReleasedIndex_;
+    // Keep these two values, and reset them in the state
+    state->keyReleased_ = -1;
+    state->keyReleasedIndex_ = -2;
+    const bool isModifier = event.origKey().isModifier();
+    if (event.isRelease()) {
+        int idx = 0;
+        for (auto &keyHandler : keyHandlers) {
+            if (keyReleased == idx &&
+                keyReleasedIndex ==
+                    event.origKey().keyListIndex(keyHandler.list)) {
+                if (isModifier) {
+                    if (keyHandler.selection < candidateList->size()) {
+                        candidateList->candidate(keyHandler.selection)
+                            .select(inputContext);
+                    }
+                    event.filterAndAccept();
+                    return true;
+                }
+                event.filter();
+                return true;
+            }
+            idx++;
+        }
+    }
+
+    if (!event.filtered() && !event.isRelease()) {
+        int idx = 0;
+        for (auto &keyHandler : keyHandlers) {
+            auto keyIdx = event.origKey().keyListIndex(keyHandler.list);
+            if (keyIdx >= 0) {
+                state->keyReleased_ = idx;
+                state->keyReleasedIndex_ = keyIdx;
+                if (isModifier) {
+                    // don't forward to input method, but make it pass
+                    // through to client.
+                    event.filter();
+                    return true;
+                }
+                if (keyHandler.selection < candidateList->size()) {
+                    candidateList->candidate(keyHandler.selection)
+                        .select(inputContext);
+                }
+                event.filterAndAccept();
+                return true;
+            }
+            idx++;
+        }
+    }
+    return false;
+}
+
+bool PinyinEngine::handleCandidateList(KeyEvent &event) {
+    auto *inputContext = event.inputContext();
+    auto candidateList = inputContext->inputPanel().candidateList();
+    if (!candidateList) {
+        return false;
+    }
+    int idx = event.key().keyListIndex(selectionKeys_);
+    if (idx >= 0) {
+        event.filterAndAccept();
+        if (idx < candidateList->size()) {
+            candidateList->candidate(idx).select(inputContext);
+        }
+        return true;
+    }
+    if (event.key().check(FcitxKey_space)) {
+        if (candidateList->size()) {
+            event.filterAndAccept();
+            int idx = candidateList->cursorIndex();
+            if (idx < 0) {
+                idx = 0;
+            }
+            candidateList->candidate(idx).select(inputContext);
+            return true;
+        }
+    }
+
+    if (event.key().checkKeyList(*config_.prevPage)) {
+        auto *pageable = candidateList->toPageable();
+        if (!pageable->hasPrev()) {
+            if (pageable->usedNextBefore()) {
+                event.filterAndAccept();
+                return true;
+            }
+        } else {
+            event.filterAndAccept();
+            pageable->prev();
+            inputContext->updateUserInterface(
+                UserInterfaceComponent::InputPanel);
+            return true;
+        }
+    }
+
+    if (event.key().checkKeyList(*config_.nextPage)) {
+        event.filterAndAccept();
+        candidateList->toPageable()->next();
+        inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+        return true;
+    }
+
+    if (auto *movable = candidateList->toCursorMovable()) {
+        if (event.key().checkKeyList(*config_.nextCandidate)) {
+            movable->nextCandidate();
+            inputContext->updateUserInterface(
+                UserInterfaceComponent::InputPanel);
+            event.filterAndAccept();
+            return true;
+        }
+        if (event.key().checkKeyList(*config_.prevCandidate)) {
+            movable->prevCandidate();
+            inputContext->updateUserInterface(
+                UserInterfaceComponent::InputPanel);
+            event.filterAndAccept();
+            return true;
+        }
+    }
+    return false;
+}
+
+void PinyinEngine::updateStroke(InputContext *inputContext) {
+    auto *state = inputContext->propertyFor(&factory_);
+    auto &inputPanel = inputContext->inputPanel();
+    inputPanel.reset();
+
+    const auto preeditWithCursor = state->context_.preeditWithCursor();
+    Text preedit = fetchAndSetClientPreedit(inputContext, state->context_);
+    preedit.append(_("\t[Stroke Filtering] "));
+    preedit.append(pinyinhelper()->call<IPinyinHelper::prettyStrokeString>(
+        state->strokeBuffer_.userInput()));
+    inputPanel.setPreedit(preedit);
+
+    auto candidateList = std::make_unique<CommonCandidateList>();
+    candidateList->setPageSize(*config_.pageSize);
+    candidateList->setCursorPositionAfterPaging(
+        CursorPositionAfterPaging::ResetToFirst);
+
+    auto *origCandidateList = state->strokeCandidateList_->toBulk();
+    for (int i = 0; i < origCandidateList->totalSize(); i++) {
+        const auto &candidate = origCandidateList->candidateFromAll(i);
+        auto str = candidate.text().toStringForCommit();
+        if (auto length = utf8::lengthValidated(str);
+            length != utf8::INVALID_LENGTH && length >= 1) {
+            auto charRange = utf8::MakeUTF8CharRange(str);
+            bool strokeMatched = false;
+            for (auto iter = std::begin(charRange), end = std::end(charRange);
+                 iter != end; ++iter) {
+                std::string chr(iter.charRange().first,
+                                iter.charRange().second);
+                auto stroke =
+                    pinyinhelper()->call<IPinyinHelper::reverseLookupStroke>(
+                        chr);
+                if (stringutils::startsWith(stroke,
+                                            state->strokeBuffer_.userInput())) {
+                    strokeMatched = true;
+                    break;
+                }
+            }
+            if (strokeMatched) {
+                candidateList->append<StrokeFilterCandidateWord>(
+                    this, candidate.text(), i);
+            }
+        }
+    }
+    candidateList->setSelectionKey(selectionKeys_);
+    if (candidateList->size()) {
+        candidateList->setGlobalCursorIndex(0);
+    }
+    inputContext->inputPanel().setCandidateList(std::move(candidateList));
+    inputContext->updatePreedit();
+    inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+}
+
+void PinyinEngine::updateForgetCandidate(InputContext *inputContext) {
+    auto *state = inputContext->propertyFor(&factory_);
+    auto &inputPanel = inputContext->inputPanel();
+    inputPanel.reset();
+
+    fetchAndSetClientPreedit(inputContext, state->context_);
+    Text aux(_("[Select the word to remove from history]"));
+    inputPanel.setAuxUp(aux);
+
+    auto candidateList = std::make_unique<CommonCandidateList>();
+    candidateList->setPageSize(*config_.pageSize);
+    candidateList->setCursorPositionAfterPaging(
+        CursorPositionAfterPaging::ResetToFirst);
+
+    auto *origCandidateList = state->forgetCandidateList_->toBulk();
+    for (int i = 0; i < origCandidateList->totalSize(); i++) {
+        const auto &candidate = origCandidateList->candidateFromAll(i);
+        if (const auto *pyCandidate =
+                dynamic_cast<const PinyinCandidateWord *>(&candidate)) {
+            if (pyCandidate->idx_ >= state->context_.candidates().size() ||
+                state->context_.candidateFullPinyin(pyCandidate->idx_)
+                    .empty()) {
+                continue;
+            }
+
+            candidateList->append<ForgetCandidateWord>(
+                this, pyCandidate->text(), pyCandidate->idx_);
+        }
+    }
+    candidateList->setSelectionKey(selectionKeys_);
+    if (candidateList->size()) {
+        candidateList->setGlobalCursorIndex(0);
+    }
+    inputContext->inputPanel().setCandidateList(std::move(candidateList));
+    inputContext->updatePreedit();
+    inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+}
+
+void PinyinEngine::resetStroke(InputContext *inputContext) {
+    auto *state = inputContext->propertyFor(&factory_);
+    state->strokeCandidateList_.reset();
+    state->strokeBuffer_.clear();
+    if (state->mode_ == PinyinMode::StrokeFilter) {
+        state->mode_ = PinyinMode::Normal;
+    }
+}
+
+void PinyinEngine::resetForgetCandidate(InputContext *inputContext) {
+    auto *state = inputContext->propertyFor(&factory_);
+    state->forgetCandidateList_.reset();
+    if (state->mode_ == PinyinMode::ForgetCandidate) {
+        state->mode_ = PinyinMode::Normal;
+    }
+}
+
+bool PinyinEngine::handleStrokeFilter(KeyEvent &event) {
+    auto *inputContext = event.inputContext();
+    auto candidateList = inputContext->inputPanel().candidateList();
+    auto *state = inputContext->propertyFor(&factory_);
+    if (state->mode_ == PinyinMode::Normal) {
+        if (candidateList && candidateList->size() && candidateList->toBulk() &&
+            event.key().checkKeyList(*config_.selectByStroke) &&
+            pinyinhelper()) {
+            resetStroke(inputContext);
+            state->strokeCandidateList_ = candidateList;
+            state->mode_ = PinyinMode::StrokeFilter;
+            updateStroke(inputContext);
+            event.filterAndAccept();
+            return true;
+        }
+        return false;
+    }
+
+    if (state->mode_ != PinyinMode::StrokeFilter) {
+        return false;
+    }
+
+    event.filterAndAccept();
+    // Skip all key combinition.
+    if (event.key().states().testAny(KeyState::SimpleMask)) {
+        return true;
+    }
+
+    if (event.key().check(FcitxKey_Escape)) {
+        resetStroke(inputContext);
+        updateUI(inputContext);
+        return true;
+    }
+    if (event.key().check(FcitxKey_BackSpace)) {
+        // Do backspace is stroke is not empty.
+        if (!state->strokeBuffer_.empty()) {
+            state->strokeBuffer_.backspace();
+            updateStroke(inputContext);
+        } else {
+            // Exit stroke mode when stroke buffer is empty.
+            resetStroke(inputContext);
+            updateUI(inputContext);
+        }
+        return true;
+    }
+    // if it gonna commit something
+    auto c = Key::keySymToUnicode(event.key().sym());
+    if (!c) {
+        return true;
+    }
+
+    if (event.key().check(FcitxKey_h) || event.key().check(FcitxKey_p) ||
+        event.key().check(FcitxKey_s) || event.key().check(FcitxKey_n) ||
+        event.key().check(FcitxKey_z)) {
+        static const std::unordered_map<FcitxKeySym, char> strokeMap{
+            {FcitxKey_h, '1'},
+            {FcitxKey_s, '2'},
+            {FcitxKey_p, '3'},
+            {FcitxKey_n, '4'},
+            {FcitxKey_z, '5'}};
+        if (auto iter = strokeMap.find(event.key().sym());
+            iter != strokeMap.end()) {
+            state->strokeBuffer_.type(iter->second);
+            updateStroke(inputContext);
+        }
+    }
+
+    return true;
+}
+
+bool PinyinEngine::handleForgetCandidate(KeyEvent &event) {
+    auto *inputContext = event.inputContext();
+    auto candidateList = inputContext->inputPanel().candidateList();
+    auto *state = inputContext->propertyFor(&factory_);
+    if (state->mode_ == PinyinMode::Normal) {
+        if (candidateList && candidateList->size() && candidateList->toBulk() &&
+            event.key().checkKeyList(*config_.forgetWord)) {
+            resetForgetCandidate(inputContext);
+            state->forgetCandidateList_ = candidateList;
+            state->mode_ = PinyinMode::ForgetCandidate;
+            updateForgetCandidate(inputContext);
+            event.filterAndAccept();
+            return true;
+        }
+        return false;
+    }
+
+    if (state->mode_ != PinyinMode::ForgetCandidate) {
+        return false;
+    }
+
+    event.filterAndAccept();
+    // Skip all key combinition.
+    if (event.key().states().testAny(KeyState::SimpleMask)) {
+        return true;
+    }
+
+    if (event.key().check(FcitxKey_Escape)) {
+        resetForgetCandidate(inputContext);
+        updateUI(inputContext);
+        return true;
+    }
+    return true;
+}
+
+bool PinyinEngine::handlePunc(KeyEvent &event) {
+    auto *inputContext = event.inputContext();
+    auto candidateList = inputContext->inputPanel().candidateList();
+    auto *state = inputContext->propertyFor(&factory_);
+    if (event.filtered()) {
+        return false;
+    }
+    // if it gonna commit something
+    auto c = Key::keySymToUnicode(event.key().sym());
+    if (event.key().hasModifier() || !c) {
+        // Handle quick phrase with modifier
+        if (event.key().check(*config_.quickphraseKey) && quickphrase()) {
+            quickphrase()->call<IQuickPhrase::trigger>(inputContext, "", "", "",
+                                                       "", Key());
+            event.filterAndAccept();
+            return true;
+        }
+        return false;
+    }
+    if (candidateList && candidateList->size()) {
+        candidateList->candidate(0).select(inputContext);
+    }
+
+    std::string punc, puncAfter;
+    // skip key pad
+    if (c && !event.key().isKeyPad()) {
+        std::tie(punc, puncAfter) =
+            punctuation()->call<IPunctuation::pushPunctuationV2>(
+                "zh_CN", inputContext, c);
+    }
+    if (event.key().check(*config_.quickphraseKey) && quickphrase()) {
+        auto keyString = utf8::UCS4ToUTF8(c);
+        // s is punc or key
+        auto output = !punc.empty() ? (punc + puncAfter) : keyString;
+        // alt is key or empty
+        auto altOutput = !punc.empty() ? keyString : "";
+        // if no punc: key -> key (s = key, alt = empty)
+        // if there's punc: key -> punc, return -> key (s = punc, alt =
+        // key)
+        std::string text;
+        if (!output.empty()) {
+            if (!altOutput.empty()) {
+                text = fmt::format(_("Press {} for {} and Return for {}"),
+                                   keyString, output, altOutput);
+            } else {
+                text = fmt::format(_("Press {} for {}"), keyString, altOutput);
+            }
+        }
+        quickphrase()->call<IQuickPhrase::trigger>(
+            inputContext, text, "", output, altOutput, *config_.quickphraseKey);
+        event.filterAndAccept();
+        return true;
+    }
+    if (!punc.empty()) {
+        event.filterAndAccept();
+        inputContext->commitString(punc + puncAfter);
+        if (size_t length = utf8::lengthValidated(puncAfter);
+            length != 0 && length != utf8::INVALID_LENGTH) {
+            for (size_t i = 0; i < length; i++) {
+                inputContext->forwardKey(Key(FcitxKey_Left));
+            }
+        }
+    }
+    state->lastIsPunc_ = true;
+    return false;
+}
+
 void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
     FCITX_UNUSED(entry);
     PINYIN_DEBUG() << "Pinyin receive key: " << event.key() << " "
                    << event.isRelease();
+    auto *inputContext = event.inputContext();
+    auto *state = inputContext->propertyFor(&factory_);
+
+    // 2nd/3rd selection is allowed to be modifier only, handle them before we
+    // skip the release.
+    if (handle2nd3rdSelection(event)) {
+        return;
+    }
 
     // by pass all key release
     if (event.isRelease()) {
@@ -613,76 +1344,25 @@ void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
         return;
     }
 
-    if (cloudpinyin() && event.key().checkKeyList(
-                             cloudpinyin()->call<ICloudPinyin::toggleKey>())) {
-        config_.cloudPinyinEnabled.setValue(!*config_.cloudPinyinEnabled);
-        safeSaveAsIni(config_, "conf/pinyin.conf");
-
-        notifications()->call<INotifications::showTip>(
-            "fcitx-cloudpinyin-toggle", "fcitx", "", _("Cloud Pinyin Status"),
-            *config_.cloudPinyinEnabled ? _("Cloud Pinyin is enabled.")
-                                        : _("Cloud Pinyin is disabled."),
-            -1);
-        if (*config_.cloudPinyinEnabled) {
-            cloudpinyin()->call<ICloudPinyin::resetError>();
-        }
-        event.filterAndAccept();
+    if (handleCloudpinyinTrigger(event)) {
         return;
     }
 
-    auto inputContext = event.inputContext();
-    auto state = inputContext->propertyFor(&factory_);
+    auto candidateList = inputContext->inputPanel().candidateList();
     bool lastIsPunc = state->lastIsPunc_;
     state->lastIsPunc_ = false;
-    // check if we can select candidate.
-    auto candidateList = inputContext->inputPanel().candidateList();
-    if (candidateList) {
-        int idx = event.key().keyListIndex(selectionKeys_);
-        if (idx >= 0) {
-            event.filterAndAccept();
-            if (idx < candidateList->size()) {
-                candidateList->candidate(idx).select(inputContext);
-            }
-            return;
-        }
 
-        if (event.key().checkKeyList(*config_.prevPage)) {
-            auto pageable = candidateList->toPageable();
-            if (!pageable->hasPrev()) {
-                if (pageable->usedNextBefore()) {
-                    event.filterAndAccept();
-                    return;
-                }
-            } else {
-                event.filterAndAccept();
-                pageable->prev();
-                inputContext->updateUserInterface(
-                    UserInterfaceComponent::InputPanel);
-                return;
-            }
-        }
+    // handle number key selection and prev/next page/candidate.
+    if (handleCandidateList(event)) {
+        return;
+    }
 
-        if (event.key().checkKeyList(*config_.nextPage)) {
-            event.filterAndAccept();
-            candidateList->toPageable()->next();
-            inputContext->updateUserInterface(
-                UserInterfaceComponent::InputPanel);
-            return;
-        }
+    if (handleStrokeFilter(event)) {
+        return;
+    }
 
-        if (auto movable = candidateList->toCursorMovable()) {
-            if (event.key().checkKeyList(*config_.nextCandidate)) {
-                movable->nextCandidate();
-                inputContext->updateUserInterface(
-                    UserInterfaceComponent::InputPanel);
-                return event.filterAndAccept();
-            } else if (event.key().checkKeyList(*config_.prevCandidate)) {
-                movable->prevCandidate();
-                inputContext->updateUserInterface(
-                    UserInterfaceComponent::InputPanel);
-                return event.filterAndAccept();
-            }
-        }
+    if (handleForgetCandidate(event)) {
+        return;
     }
 
     // In prediction, as long as it's not candidate selection, clear, then
@@ -697,27 +1377,52 @@ void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
 
     auto checkSp = [this](const KeyEvent &event, PinyinState *state) {
         auto shuangpinProfile = ime_->shuangpinProfile();
-        return state->context_.useShuangpin() && shuangpinProfile &&
-               event.key().isSimple() &&
-               shuangpinProfile->validInput().count(
-                   Key::keySymToUnicode(event.key().sym()));
+        if (!state->context_.useShuangpin() || !shuangpinProfile ||
+            !event.key().isSimple()) {
+            return false;
+        }
+        // event.key().isSimple() make sure the return value is within range of
+        // char.
+        char chr = Key::keySymToUnicode(event.key().sym());
+        return (!state->context_.empty() &&
+                shuangpinProfile->validInput().count(chr)) ||
+               (state->context_.empty() &&
+                shuangpinProfile->validInitial().count(chr));
     };
 
-    if (event.key().isLAZ() ||
-        (event.key().check(FcitxKey_apostrophe) && state->context_.size()) ||
-        (state->context_.size() && checkSp(event, state))) {
+    if (!event.key().hasModifier() && quickphrase()) {
+        const auto iter =
+            quickphraseTriggerDict_.find(state->context_.userInput());
+        if (iter != quickphraseTriggerDict_.end() && !iter->second.empty() &&
+            iter->second.count(Key::keySymToUnicode(event.key().sym()))) {
+            std::string text = state->context_.userInput();
+            text.append(Key::keySymToUTF8(event.key().sym()));
+            doReset(inputContext);
+            quickphrase()->call<IQuickPhrase::trigger>(inputContext, "", text,
+                                                       "", "", Key());
+
+            return event.filterAndAccept();
+        }
+    }
+
+    if (event.key().isLAZ() || event.key().isUAZ() ||
+        (event.key().check(FcitxKey_apostrophe) && !state->context_.empty()) ||
+        checkSp(event, state)) {
         // first v, use it to trigger quickphrase
         if (!state->context_.useShuangpin() && quickphrase() &&
-            event.key().check(FcitxKey_v) && !state->context_.size()) {
+            *config_.useVAsQuickphrase && event.key().check(FcitxKey_v) &&
+            state->context_.empty()) {
 
             quickphrase()->call<IQuickPhrase::trigger>(
                 inputContext, "", "v", "", "", Key(FcitxKey_None));
             event.filterAndAccept();
             return;
         }
-        state->context_.type(Key::keySymToUTF8(event.key().sym()));
         event.filterAndAccept();
-    } else if (state->context_.size()) {
+        if (!state->context_.type(Key::keySymToUTF8(event.key().sym()))) {
+            return;
+        }
+    } else if (!state->context_.empty()) {
         // key to handle when it is not empty.
         if (event.key().check(FcitxKey_BackSpace)) {
             if (state->context_.selectedLength()) {
@@ -728,6 +1433,22 @@ void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
             event.filterAndAccept();
         } else if (event.key().check(FcitxKey_Delete)) {
             state->context_.del();
+            event.filterAndAccept();
+        } else if (event.key().check(FcitxKey_BackSpace, KeyState::Ctrl)) {
+            if (state->context_.cursor() == state->context_.selectedLength()) {
+                state->context_.cancel();
+            }
+            auto cursor = state->context_.pinyinBeforeCursor();
+            if (cursor >= 0) {
+                state->context_.erase(cursor, state->context_.cursor());
+            }
+            event.filterAndAccept();
+        } else if (event.key().check(FcitxKey_Delete, KeyState::Ctrl)) {
+            auto cursor = state->context_.pinyinAfterCursor();
+            if (cursor >= 0 &&
+                static_cast<size_t>(cursor) <= state->context_.size()) {
+                state->context_.erase(state->context_.cursor(), cursor);
+            }
             event.filterAndAccept();
         } else if (event.key().check(FcitxKey_Home)) {
             state->context_.setCursor(state->context_.selectedLength());
@@ -769,23 +1490,32 @@ void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
         } else if (event.key().check(FcitxKey_Escape)) {
             state->context_.clear();
             event.filterAndAccept();
-        } else if (event.key().check(FcitxKey_Return)) {
+        } else if (event.key().sym() == FcitxKey_Return) {
             inputContext->commitString(state->context_.userInput());
             state->context_.clear();
             event.filterAndAccept();
-        } else if (event.key().check(FcitxKey_space)) {
-            auto candidateList = inputContext->inputPanel().candidateList();
-            if (candidateList && candidateList->size()) {
-                event.filterAndAccept();
-                int idx = candidateList->cursorIndex();
-                if (idx < 0) {
-                    idx = 0;
+        } else if (int idx =
+                       event.key().keyListIndex(*config_.selectCharFromPhrase);
+                   idx >= 0) {
+            if (candidateList && candidateList->size() &&
+                candidateList->cursorIndex() >= 0) {
+                auto str =
+                    candidateList->candidate(candidateList->cursorIndex())
+                        .text()
+                        .toStringForCommit();
+                // Validate string and length.
+                if (auto len = utf8::lengthValidated(str);
+                    len != utf8::INVALID_LENGTH &&
+                    len > static_cast<size_t>(idx)) {
+                    // Get idx-th char.
+                    auto charRange =
+                        std::next(utf8::MakeUTF8CharRange(str).begin(), idx)
+                            .charRange();
+                    std::string chr(charRange.first, charRange.second);
+                    inputContext->commitString(chr);
+                    event.filterAndAccept();
+                    state->context_.clear();
                 }
-                inputContext->inputPanel()
-                    .candidateList()
-                    ->candidate(idx)
-                    .select(inputContext);
-                return;
             }
         }
     } else {
@@ -801,9 +1531,9 @@ void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
                         instance()->eventLoop().addTimeEvent(
                             CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 300, 0,
                             [this, ref, puncStr](EventSourceTime *, uint64_t) {
-                                if (auto inputContext = ref.get()) {
+                                if (auto *inputContext = ref.get()) {
                                     inputContext->commitString(puncStr);
-                                    auto state =
+                                    auto *state =
                                         inputContext->propertyFor(&factory_);
                                     state->cancelLastEvent_.reset();
                                 }
@@ -815,55 +1545,8 @@ void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
             }
         }
     }
-    if (!event.filtered()) {
-        if (event.key().states().testAny(KeyState::SimpleMask)) {
-            return;
-        }
-        // if it gonna commit something
-        auto c = Key::keySymToUnicode(event.key().sym());
-        if (c) {
-            if (inputContext->inputPanel().candidateList() &&
-                inputContext->inputPanel().candidateList()->size()) {
-                inputContext->inputPanel().candidateList()->candidate(0).select(
-                    inputContext);
-            }
-            auto punc = punctuation()->call<IPunctuation::pushPunctuation>(
-                "zh_CN", inputContext, c);
-            if (event.key().check(FcitxKey_semicolon) && quickphrase()) {
-                auto keyString = utf8::UCS4ToUTF8(c);
-                // s is punc or key
-                auto output = punc.size() ? punc : keyString;
-                // alt is key or empty
-                auto altOutput = punc.size() ? keyString : "";
-                // if no punc: key -> key (s = key, alt = empty)
-                // if there's punc: key -> punc, return -> key (s = punc, alt =
-                // key)
-                std::string text;
-                if (!output.empty()) {
-                    if (!altOutput.empty()) {
-                        text = boost::str(
-                            boost::format(
-                                _("Press %1% for %2% and %3% for %4%")) %
-                            keyString % output % _("Return") % altOutput);
-                    } else {
-                        text =
-                            boost::str(boost::format(_("Press %1% for %2%")) %
-                                       keyString % altOutput);
-                    }
-                }
-                quickphrase()->call<IQuickPhrase::trigger>(
-                    inputContext, text, "", output, altOutput,
-                    Key(FcitxKey_semicolon));
-                event.filterAndAccept();
-                return;
-            }
-
-            if (punc.size()) {
-                event.filterAndAccept();
-                inputContext->commitString(punc);
-            }
-            state->lastIsPunc_ = true;
-        }
+    if (handlePunc(event)) {
+        return;
     }
 
     if (event.filtered() && event.accepted()) {
@@ -879,28 +1562,33 @@ void PinyinEngine::setSubConfig(const std::string &path, const RawConfig &) {
     } else if (path == "clearalldict") {
         ime_->dict()->clear(libime::PinyinDictionary::UserDict);
         ime_->model()->history().clear();
-        ;
     }
 }
 
 void PinyinEngine::reset(const InputMethodEntry &, InputContextEvent &event) {
-    auto inputContext = event.inputContext();
+    auto *inputContext = event.inputContext();
     doReset(inputContext);
 }
 
 void PinyinEngine::doReset(InputContext *inputContext) {
-    auto state = inputContext->propertyFor(&factory_);
+    auto *state = inputContext->propertyFor(&factory_);
+    resetStroke(inputContext);
+    resetForgetCandidate(inputContext);
+    state->mode_ = PinyinMode::Normal;
     state->context_.clear();
     state->predictWords_.clear();
     inputContext->inputPanel().reset();
     inputContext->updatePreedit();
     inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
     // state->lastIsPunc_ = false;
+
+    state->keyReleased_ = -1;
+    state->keyReleasedIndex_ = -2;
 }
 
 void PinyinEngine::save() {
     safeSaveAsIni(config_, "conf/pinyin.conf");
-    auto &standardPath = StandardPath::global();
+    const auto &standardPath = StandardPath::global();
     standardPath.safeSave(
         StandardPath::Type::PkgData, "pinyin/user.dict", [this](int fd) {
             boost::iostreams::stream_buffer<
@@ -937,9 +1625,10 @@ void PinyinEngine::save() {
 void PinyinEngine::cloudPinyinSelected(InputContext *inputContext,
                                        const std::string &selected,
                                        const std::string &word) {
-    auto state = inputContext->propertyFor(&factory_);
+    auto *state = inputContext->propertyFor(&factory_);
     auto words = state->context_.selectedWords();
-    auto preedit = state->context_.preedit();
+    // This ensure us to convert pinyin to the right one.
+    auto preedit = state->context_.preedit(libime::PinyinPreeditMode::RawText);
     do {
         if (!stringutils::startsWith(preedit, selected)) {
             break;
@@ -953,7 +1642,7 @@ void PinyinEngine::cloudPinyinSelected(InputContext *inputContext,
         const auto &candidates = state->context_.candidates();
         auto pinyinsIter = pinyins.begin();
         auto pinyinsEnd = pinyins.end();
-        if (candidates.size()) {
+        if (!candidates.empty()) {
             const auto &bestSentence = candidates[0].sentence();
             auto iter = bestSentence.begin();
             auto end = bestSentence.end();
@@ -962,11 +1651,11 @@ void PinyinEngine::cloudPinyinSelected(InputContext *inputContext,
                 if (!consumePreifx(consumed, (*iter)->word())) {
                     break;
                 }
-                if ((*iter)->word().size()) {
+                if (!(*iter)->word().empty()) {
                     words.push_back((*iter)->word());
                     PINYIN_DEBUG()
                         << "Cloud Pinyin can reuse segment " << (*iter)->word();
-                    auto pinyinNode =
+                    const auto *pinyinNode =
                         static_cast<const libime::PinyinLatticeNode *>(*iter);
                     auto pinyinSize = pinyinNode->encodedPinyin().size() / 2;
                     if (pinyinSize &&
@@ -995,7 +1684,29 @@ void PinyinEngine::cloudPinyinSelected(InputContext *inputContext,
                 ime_->dict()->addWord(libime::PinyinDictionary::UserDict,
                                       joined, word);
             } else {
+                if (state->context_.useShuangpin()) {
+                    bool end = false;
+                    for (auto &sppinyin :
+                         MakeIterRange(pinyinsIter, pinyinsEnd)) {
+                        // Likely something goes wrong.
+                        if (sppinyin.size() > 2) {
+                            end = true;
+                            break;
+                        }
+                        sppinyin = libime::PinyinEncoder::shuangpinToPinyin(
+                            sppinyin, *ime_->shuangpinProfile());
+                        if (sppinyin.empty()) {
+                            end = true;
+                            break;
+                        }
+                    }
+                    if (end) {
+                        break;
+                    }
+                }
                 auto joined = stringutils::join(pinyinsIter, pinyinsEnd, "'");
+                PINYIN_DEBUG()
+                    << "Cloud pinyin saves word: " << wordView << " " << joined;
                 ime_->dict()->addWord(libime::PinyinDictionary::UserDict,
                                       joined, wordView);
                 words.push_back(std::string{wordView});

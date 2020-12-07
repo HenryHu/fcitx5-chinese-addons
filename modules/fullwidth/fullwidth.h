@@ -1,25 +1,14 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #ifndef _FULLWIDTH_FULLWIDTH_H_
 #define _FULLWIDTH_FULLWIDTH_H_
 
 #include <fcitx-config/configuration.h>
+#include <fcitx-config/iniparser.h>
 #include <fcitx-utils/i18n.h>
 #include <fcitx/action.h>
 #include <fcitx/addoninstance.h>
@@ -57,7 +46,11 @@ public:
     Fullwidth(fcitx::Instance *instance);
 
     void reloadConfig() override;
-    void save() override;
+    const fcitx::Configuration *getConfig() const override { return &config_; }
+    void setConfig(const fcitx::RawConfig &config) override {
+        config_.load(config, true);
+        fcitx::safeSaveAsIni(config_, "conf/fullwidth.conf");
+    }
 
     FCITX_ADDON_DEPENDENCY_LOADER(notifications, instance_->addonManager());
 
@@ -74,7 +67,6 @@ private:
     bool enabled_ = false;
     fcitx::Instance *instance_;
     FullWidthConfig config_;
-    fcitx::AddonInstance *notifications_ = nullptr;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         eventHandlers_;
     fcitx::ScopedConnection commitFilterConn_;

@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #ifndef _TABLE_STATE_H_
 #define _TABLE_STATE_H_
 
@@ -28,6 +16,7 @@ namespace fcitx {
 enum class TableMode {
     Normal,
     ModifyDictionary,
+    ForgetWord,
     Pinyin,
     LookupPinyin,
 };
@@ -44,7 +33,7 @@ public:
     bool lastIsPunc_ = false;
     std::unique_ptr<EventSourceTime> cancelLastEvent_;
 
-    TableContext *context(const InputMethodEntry *entry);
+    TableContext *updateContext(const InputMethodEntry *entry);
     void release();
     void reset(const InputMethodEntry *entry = nullptr);
 
@@ -52,25 +41,49 @@ public:
 
     void commitBuffer(bool commitCode, bool noRealCommit = false);
     void updateUI();
-    void pushLastCommit(const std::string &lastSegment);
+    void pushLastCommit(const std::string &code,
+                        const std::string &lastSegment);
+
+    void commitAfterSelect(int commitFrom);
+
+    auto mode() const { return mode_; }
+
+    void forgetCandidateWord(size_t idx);
+    void handle2nd3rdCandidate(KeyEvent &event) {
+        auto *context = context_.get();
+        if (!context) {
+            return;
+        }
+
+        const auto &config = context->config();
+        handle2nd3rdCandidate(config, event);
+    }
 
 private:
+    bool handle2nd3rdCandidate(const TableConfig &config, KeyEvent &event);
     bool handleCandidateList(const TableConfig &config, KeyEvent &event);
+    bool handleForgetWord(KeyEvent &event);
     bool handlePinyinMode(KeyEvent &event);
     bool handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event);
-    bool handleAddPhraseMode(KeyEvent &event);
+
+    bool isContextEmpty() const;
+    bool autoSelectCandidate();
+    std::string commitSegements(size_t from, size_t to);
 
     TableMode mode_ = TableMode::Normal;
     std::string pinyinModePrefix_;
     InputBuffer pinyinModeBuffer_{
         {InputBufferOption::AsciiOnly, InputBufferOption::FixedCursor}};
     size_t lookupPinyinIndex_ = 0;
-    std::string lookupPinyinString_;
+    std::vector<std::pair<std::string, std::string>> lookupPinyinString_;
     std::string lastContext_;
-    std::string lastCommit_;
+    std::list<std::pair<std::string, std::string>> lastCommit_;
     std::string lastSegment_;
-    std::list<std::string> lastSingleCharCommit_;
+    std::list<std::pair<std::string, std::string>> lastSingleCharCommit_;
     std::unique_ptr<TableContext> context_;
+
+    int keyReleased_ = -1;
+    int keyReleasedIndex_ = -2;
 };
 } // namespace fcitx
 

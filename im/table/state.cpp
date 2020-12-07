@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "state.h"
 #include "pinyinhelper_public.h"
 #include "punctuation_public.h"
@@ -32,19 +20,47 @@ namespace fcitx {
 
 namespace {
 
+class CommitAfterSelectWrapper {
+public:
+    CommitAfterSelectWrapper(TableState *state) : state_(state) {
+        if (auto *context = state->updateContext(nullptr)) {
+            commitFrom_ = context->selectedSize();
+        }
+    }
+    ~CommitAfterSelectWrapper() {
+        if (commitFrom_ >= 0) {
+            state_->commitAfterSelect(commitFrom_);
+        }
+    }
+
+private:
+    TableState *state_;
+    int commitFrom_ = -1;
+};
+
 class TableCandidateWord : public CandidateWord {
 public:
     TableCandidateWord(TableEngine *engine, Text text, size_t idx)
         : CandidateWord(std::move(text)), engine_(engine), idx_(idx) {}
 
     void select(InputContext *inputContext) const override {
-        auto state = inputContext->propertyFor(&engine_->factory());
+        auto *state = inputContext->propertyFor(&engine_->factory());
         // nullptr means use the last requested entry.
-        auto *context = state->context(nullptr);
+        auto *context = state->updateContext(nullptr);
         if (!context || idx_ >= context->candidates().size()) {
             return;
         }
-        context->select(idx_);
+        if (state->mode() == TableMode::ForgetWord) {
+            state->forgetCandidateWord(idx_);
+            return;
+        }
+        {
+            CommitAfterSelectWrapper commitAfterSelectRAII(state);
+            context->select(idx_);
+        }
+        if (context->selected()) {
+            state->commitBuffer(true);
+        }
         state->updateUI();
     }
 
@@ -57,7 +73,7 @@ public:
     TablePinyinCandidateWord(TableEngine *engine, std::string word,
                              const libime::TableBasedDictionary &dict,
                              bool customHint)
-        : CandidateWord(), engine_(engine), word_(std::move(word)) {
+        : engine_(engine), word_(std::move(word)) {
         Text text;
         text.append(word_);
         if (utf8::lengthValidated(word_) == 1) {
@@ -75,9 +91,9 @@ public:
     }
 
     void select(InputContext *inputContext) const override {
-        auto state = inputContext->propertyFor(&engine_->factory());
+        auto *state = inputContext->propertyFor(&engine_->factory());
         inputContext->commitString(word_);
-        state->pushLastCommit(word_);
+        state->pushLastCommit("", word_);
         state->reset();
     }
 
@@ -86,7 +102,7 @@ public:
 };
 } // namespace
 
-TableContext *TableState::context(const InputMethodEntry *entry) {
+TableContext *TableState::updateContext(const InputMethodEntry *entry) {
     if (!entry || lastContext_ == entry->uniqueName()) {
         return context_.get();
     }
@@ -107,43 +123,77 @@ void TableState::release() {
     context_.reset();
 }
 
-void TableState::pushLastCommit(const std::string &lastSegment) {
+std::string TableState::commitSegements(size_t from, size_t to) {
+    auto *context = context_.get();
+    if (!context) {
+        return "";
+    }
+
+    std::string sentence;
+    const auto &config = context->config();
+    for (size_t i = from; i < to; i++) {
+        auto seg = context->selectedSegment(i);
+        if (std::get<bool>(seg) || *config.commitInvalidSegment) {
+            std::string code;
+            const auto &word = std::get<std::string>(seg);
+            if (utf8::length(word) == 1) {
+                code = context->selectedCode(i);
+            }
+            pushLastCommit(code, word);
+            sentence += word;
+        }
+    }
+    return sentence;
+}
+
+void TableState::pushLastCommit(const std::string &code,
+                                const std::string &lastSegment) {
     if (lastSegment.empty() ||
         ic_->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
         return;
     }
 
-    lastCommit_ += lastSegment;
-    constexpr size_t limit = 10;
-    auto length = utf8::length(lastCommit_);
     TABLE_DEBUG() << "TableState::pushLastCommit " << lastSegment
-                  << " length: " << utf8::length(lastSegment);
-    if (utf8::length(lastSegment) == 1) {
-        lastSingleCharCommit_.push_back(lastSegment);
-        while (lastSingleCharCommit_.size() > 10) {
+                  << " code: " << code;
+    constexpr size_t limit = 10;
+    const auto length = utf8::length(lastSegment);
+    if (length == 1) {
+        lastSingleCharCommit_.emplace_back(code, lastSegment);
+        while (lastSingleCharCommit_.size() > limit) {
             lastSingleCharCommit_.pop_front();
         }
-        auto singleCharString = stringutils::join(lastSingleCharCommit_, "");
-        TABLE_DEBUG() << "learnAutoPhrase " << singleCharString;
-        context_->learnAutoPhrase(singleCharString);
+
+        std::string singleCharString;
+        std::vector<std::string> codeHints;
+        for (const auto &[code, chr] : lastSingleCharCommit_) {
+            singleCharString += chr;
+            codeHints.push_back(code);
+        }
+        TABLE_DEBUG() << "learnAutoPhrase " << singleCharString << codeHints;
+        context_->learnAutoPhrase(singleCharString, codeHints);
     } else {
         lastSingleCharCommit_.clear();
     }
 
-    if (length > limit) {
-        auto iter = lastCommit_.begin();
-        while (length > limit) {
-            iter = utf8::nextChar(iter);
-            length--;
+    if (length == 1) {
+        lastCommit_.emplace_back(code, lastSegment);
+    } else {
+        auto range = fcitx::utf8::MakeUTF8CharRange(lastSegment);
+        for (auto iter = std::begin(range); iter != std::end(range); iter++) {
+            lastCommit_.emplace_back("", iter.view());
         }
-        lastCommit_ =
-            lastCommit_.substr(std::distance(lastCommit_.begin(), iter));
+    }
+
+    if (lastCommit_.size() > limit) {
+        while (lastCommit_.size() > limit) {
+            lastCommit_.pop_front();
+        }
     }
     lastSegment_ = lastSegment;
 }
 
 void TableState::reset(const InputMethodEntry *entry) {
-    auto context = this->context(entry);
+    auto *context = updateContext(entry);
     if (context) {
         context->clear();
     }
@@ -154,11 +204,38 @@ void TableState::reset(const InputMethodEntry *entry) {
     mode_ = TableMode::Normal;
     pinyinModePrefix_.clear();
     pinyinModeBuffer_.clear();
+
+    keyReleased_ = -1;
+    keyReleasedIndex_ = -2;
+}
+
+bool TableState::isContextEmpty() const {
+    if (!context_) {
+        return true;
+    }
+
+    if (*context_->config().commitAfterSelect) {
+        return context_->empty() || context_->selected();
+    }
+    return context_->empty();
+}
+
+bool TableState::autoSelectCandidate() {
+    auto candidateList = ic_->inputPanel().candidateList();
+    if (candidateList && candidateList->size()) {
+        int idx = candidateList->cursorIndex();
+        if (idx < 0) {
+            idx = 0;
+        }
+        candidateList->candidate(idx).select(ic_);
+        return true;
+    }
+    return false;
 }
 
 bool TableState::handleCandidateList(const TableConfig &config,
                                      KeyEvent &event) {
-    auto inputContext = event.inputContext();
+    auto *inputContext = event.inputContext();
     // check if we can select candidate.
     auto candidateList = inputContext->inputPanel().candidateList();
     if (!candidateList) {
@@ -175,7 +252,7 @@ bool TableState::handleCandidateList(const TableConfig &config,
     }
 
     if (event.key().checkKeyList(*config.prevPage)) {
-        auto pageable = candidateList->toPageable();
+        auto *pageable = candidateList->toPageable();
         if (!pageable->hasPrev()) {
             if (pageable->usedNextBefore()) {
                 event.filterAndAccept();
@@ -196,14 +273,15 @@ bool TableState::handleCandidateList(const TableConfig &config,
         inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
         return true;
     }
-    if (auto movable = candidateList->toCursorMovable()) {
+    if (auto *movable = candidateList->toCursorMovable()) {
         if (event.key().checkKeyList(*config.nextCandidate)) {
             movable->nextCandidate();
             inputContext->updateUserInterface(
                 UserInterfaceComponent::InputPanel);
             event.filterAndAccept();
             return true;
-        } else if (event.key().checkKeyList(*config.prevCandidate)) {
+        }
+        if (event.key().checkKeyList(*config.prevCandidate)) {
             movable->prevCandidate();
             inputContext->updateUserInterface(
                 UserInterfaceComponent::InputPanel);
@@ -216,16 +294,20 @@ bool TableState::handleCandidateList(const TableConfig &config,
 }
 
 bool TableState::handlePinyinMode(KeyEvent &event) {
-    auto context = context_.get();
+    auto *context = context_.get();
     const auto &pinyinKey = *context->config().pinyinKey;
     if (pinyinKey.sym() == FcitxKey_None) {
         return false;
     }
     bool needUpdate = false;
     if (mode_ == TableMode::Normal && event.key().check(pinyinKey)) {
-        if (context->size() != 0) {
-            commitBuffer(false);
+        auto chr = Key::keySymToUnicode(event.key().sym());
+        if (!isContextEmpty()) {
+            if (context->isValidInput(chr)) {
+                return false;
+            }
         }
+        commitBuffer(true);
         mode_ = TableMode::Pinyin;
         event.filterAndAccept();
 
@@ -241,7 +323,7 @@ bool TableState::handlePinyinMode(KeyEvent &event) {
             pinyinModeBuffer_.type(Key::keySymToUTF8(event.key().sym()));
             needUpdate = true;
         } else if (event.key().check(FcitxKey_BackSpace)) {
-            if (pinyinModeBuffer_.size()) {
+            if (!pinyinModeBuffer_.empty()) {
                 pinyinModeBuffer_.backspace();
                 needUpdate = true;
             } else {
@@ -249,15 +331,10 @@ bool TableState::handlePinyinMode(KeyEvent &event) {
                 return true;
             }
         } else if (event.key().check(FcitxKey_space)) {
-            auto candidateList = ic_->inputPanel().candidateList();
-            if (candidateList && candidateList->size()) {
-                int idx = candidateList->cursorIndex();
-                if (idx < 0) {
-                    idx = 0;
-                }
-                candidateList->candidate(idx).select(ic_);
+            if (autoSelectCandidate()) {
                 return true;
-            } else if (!pinyinModeBuffer_.size()) {
+            }
+            if (pinyinModeBuffer_.empty()) {
                 if (!lastSegment_.empty()) {
                     ic_->commitString(lastSegment_);
                 }
@@ -271,67 +348,100 @@ bool TableState::handlePinyinMode(KeyEvent &event) {
             reset();
         }
     }
-    if (needUpdate) {
-        auto &inputPanel = ic_->inputPanel();
-        ic_->inputPanel().reset();
-
-        if (pinyinModeBuffer_.size()) {
-            auto &dict = engine_->pinyinDict();
-            auto &lm = engine_->pinyinModel();
-            auto pinyin = libime::PinyinEncoder::encodeOneUserPinyin(
-                pinyinModeBuffer_.userInput());
-
-            auto candidateList = std::make_unique<CommonCandidateList>();
-            candidateList->setSelectionKey(*context_->config().selection);
-            candidateList->setPageSize(*context_->config().pageSize);
-            std::vector<std::pair<std::string, float>> pinyinWords;
-
-            dict.matchWords(pinyin.data(), pinyin.size(),
-                            [&pinyinWords, &lm](std::string_view,
-                                                std::string_view hanzi, float) {
-                                pinyinWords.emplace_back(
-                                    hanzi, lm.singleWordScore(hanzi));
-                                return true;
-                            });
-
-            std::sort(pinyinWords.begin(), pinyinWords.end(),
-                      [](const auto &lhs, const auto &rhs) {
-                          return lhs.second > rhs.second;
-                      });
-
-            for (auto &p : pinyinWords) {
-                candidateList->append<TablePinyinCandidateWord>(
-                    engine_, std::move(p.first), context_->dict(),
-                    *context_->config().displayCustomHint);
-            }
-
-            if (candidateList->size()) {
-                inputPanel.setCandidateList(std::move(candidateList));
-            }
-        } else {
-            if (!lastSegment_.empty()) {
-                inputPanel.setAuxDown(Text(lastSegment_));
-            }
-        }
-        Text preeditText;
-        preeditText.append(pinyinModePrefix_);
-        preeditText.append(pinyinModeBuffer_.userInput());
-        if (ic_->capabilityFlags().test(CapabilityFlag::Preedit)) {
-            preeditText.setCursor(0);
-            inputPanel.setClientPreedit(preeditText);
-        } else {
-            preeditText.setCursor(preeditText.textLength());
-            inputPanel.setPreedit(preeditText);
-        }
-        ic_->updatePreedit();
-        ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
+    if (!needUpdate) {
+        return false;
     }
+    auto &inputPanel = ic_->inputPanel();
+    ic_->inputPanel().reset();
+
+    if (!pinyinModeBuffer_.empty()) {
+        const auto &dict = engine_->pinyinDict();
+        const auto &lm = engine_->pinyinModel();
+        const auto &config = context_->config();
+        auto pinyin = libime::PinyinEncoder::encodeOneUserPinyin(
+            pinyinModeBuffer_.userInput());
+
+        auto candidateList = std::make_unique<CommonCandidateList>();
+        candidateList->setLayoutHint(*config.candidateLayoutHint);
+        candidateList->setCursorPositionAfterPaging(
+            CursorPositionAfterPaging::ResetToFirst);
+        candidateList->setSelectionKey(*config.selection);
+        candidateList->setPageSize(*config.pageSize);
+
+        std::vector<std::pair<std::string, float>> pinyinWords;
+
+        dict.matchWords(pinyin.data(), pinyin.size(),
+                        [&pinyinWords, &lm](std::string_view,
+                                            std::string_view hanzi, float) {
+                            pinyinWords.emplace_back(hanzi,
+                                                     lm.singleWordScore(hanzi));
+                            return true;
+                        });
+
+        std::sort(pinyinWords.begin(), pinyinWords.end(),
+                  [](const auto &lhs, const auto &rhs) {
+                      return lhs.second > rhs.second;
+                  });
+
+        for (auto &p : pinyinWords) {
+            candidateList->append<TablePinyinCandidateWord>(
+                engine_, std::move(p.first), context_->dict(),
+                *config.displayCustomHint);
+        }
+
+        if (candidateList->size()) {
+            candidateList->setGlobalCursorIndex(0);
+            inputPanel.setCandidateList(std::move(candidateList));
+        }
+    } else {
+        if (!lastSegment_.empty()) {
+            inputPanel.setAuxDown(Text(lastSegment_));
+        }
+    }
+    Text preeditText;
+    preeditText.append(pinyinModePrefix_);
+    preeditText.append(pinyinModeBuffer_.userInput());
+    if (ic_->capabilityFlags().test(CapabilityFlag::Preedit)) {
+        preeditText.setCursor(0);
+        inputPanel.setClientPreedit(preeditText);
+    } else {
+        preeditText.setCursor(preeditText.textLength());
+        inputPanel.setPreedit(preeditText);
+    }
+    ic_->updatePreedit();
+    ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
     return true;
+}
+
+bool TableState::handleForgetWord(KeyEvent &event) {
+    auto *inputContext = event.inputContext();
+    auto candidateList = inputContext->inputPanel().candidateList();
+    if (!candidateList || candidateList->size() == 0) {
+        return false;
+    }
+    if (mode_ == TableMode::Normal &&
+        event.key().checkKeyList(*engine_->config().forgetWord)) {
+        mode_ = TableMode::ForgetWord;
+        event.filterAndAccept();
+        updateUI();
+        return true;
+    }
+    if (mode_ == TableMode::ForgetWord && event.key().check(FcitxKey_Escape)) {
+        mode_ = TableMode::Normal;
+        event.filterAndAccept();
+        updateUI();
+        return true;
+    }
+
+    if (mode_ == TableMode::ForgetWord) {
+        event.filterAndAccept();
+        return true;
+    }
+    return false;
 }
 
 bool TableState::handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event) {
     // Lookup pinyin and addPhrase may share some code.
-    auto context = context_.get();
     bool needUpdate = false;
     if (mode_ == TableMode::Normal) {
         if (event.key().checkKeyList(*engine_->config().lookupPinyin)) {
@@ -344,65 +454,74 @@ bool TableState::handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event) {
             return false;
         }
 
-        if (context->size() != 0) {
-            commitBuffer(false);
-        }
+        commitBuffer(false);
         lookupPinyinIndex_ = 0;
-        lookupPinyinString_ = lastCommit_;
+        lookupPinyinString_.assign(lastCommit_.begin(), lastCommit_.end());
         if (ic_->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
             ic_->surroundingText().isValid()) {
             auto text = ic_->surroundingText().selectedText();
             if (!text.empty()) {
-                lookupPinyinString_ = std::move(text);
+                lookupPinyinString_.clear();
+                auto range = utf8::MakeUTF8CharRange(text);
+                for (auto iter = std::begin(range), end = std::end(range);
+                     iter != end; ++iter) {
+                    lookupPinyinString_.emplace_back("", iter.view());
+                }
             }
         }
+        FCITX_INFO() << lookupPinyinString_;
         needUpdate = true;
     } else if (mode_ != TableMode::LookupPinyin &&
-               mode_ != TableMode::ModifyDictionary) {
+               mode_ != TableMode::ModifyDictionary &&
+               mode_ != TableMode::ForgetWord) {
         return false;
     }
 
     event.filterAndAccept();
     if (event.key().check(FcitxKey_Left)) {
         needUpdate = true;
-        auto length = utf8::length(lookupPinyinString_);
-        if (length != 0) {
+        if (lookupPinyinString_.size() != 0) {
             lookupPinyinIndex_ += 1;
-            if (lookupPinyinIndex_ >= length) {
-                lookupPinyinIndex_ = length - 1;
+            if (lookupPinyinIndex_ >= lookupPinyinString_.size()) {
+                lookupPinyinIndex_ = lookupPinyinString_.size() - 1;
             }
         }
     } else if (event.key().check(FcitxKey_Right)) {
         needUpdate = true;
-        auto length = utf8::length(lookupPinyinString_);
-        if (length != 0) {
-            if (lookupPinyinIndex_ >= length) {
-                lookupPinyinIndex_ = length - 1;
+        if (lookupPinyinString_.size() != 0) {
+            if (lookupPinyinIndex_ >= lookupPinyinString_.size()) {
+                lookupPinyinIndex_ = lookupPinyinString_.size() - 1;
             } else if (lookupPinyinIndex_ > 0) {
                 lookupPinyinIndex_ -= 1;
             }
         }
     }
 
-    auto length = utf8::length(lookupPinyinString_);
     auto getSubString = [&]() {
-        if (lookupPinyinIndex_ >= length) {
-            lookupPinyinIndex_ = length - 1;
+        if (lookupPinyinIndex_ >= lookupPinyinString_.size()) {
+            lookupPinyinIndex_ = lookupPinyinString_.size() - 1;
         }
-        auto idx = length - lookupPinyinIndex_ - 1;
-        auto iter = utf8::nextNChar(lookupPinyinString_.begin(), idx);
-        return std::string(iter, lookupPinyinString_.end());
+        std::string str;
+        std::vector<std::string> hints;
+        for (auto idx = lookupPinyinString_.size() - lookupPinyinIndex_ - 1;
+             idx < lookupPinyinString_.size(); ++idx) {
+            str += lookupPinyinString_[idx].second;
+            hints.push_back(lookupPinyinString_[idx].first);
+        }
+        return std::make_pair(str, hints);
     };
 
-    if (length != 0 && length != utf8::INVALID_LENGTH) {
+    if (!lookupPinyinString_.empty()) {
         if (event.key().check(FcitxKey_space) &&
             mode_ == TableMode::ModifyDictionary) {
             auto subString = getSubString();
             std::string result;
-            if (context_->dict().generate(subString, result)) {
-                if (context_->dict().wordExists(result, subString) ==
+            if (context_->dict().generateWithHint(subString.first,
+                                                  subString.second, result)) {
+                if (context_->dict().wordExists(result, subString.first) ==
                     libime::PhraseFlag::Invalid) {
-                    context_->mutableDict().insert(subString);
+                    context_->mutableDict().insert(result, subString.first,
+                                                   libime::PhraseFlag::User);
                     reset();
                     return true;
                 }
@@ -412,14 +531,18 @@ bool TableState::handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event) {
                    mode_ == TableMode::ModifyDictionary) {
             auto subString = getSubString();
             std::string result;
-            if (context_->dict().generate(subString, result)) {
-                auto flag = context_->dict().wordExists(result, subString);
+            if (context_->dict().generateWithHint(subString.first,
+                                                  subString.second, result)) {
+                auto flag =
+                    context_->dict().wordExists(result, subString.first);
                 if (flag != libime::PhraseFlag::Invalid) {
-                    if (flag == libime::PhraseFlag::User &&
+                    if ((flag == libime::PhraseFlag::User ||
+                         flag == libime::PhraseFlag::Auto) &&
                         event.key().check(FcitxKey_Delete)) {
-                        context_->mutableDict().removeWord(result, subString);
+                        context_->mutableDict().removeWord(result,
+                                                           subString.first);
                     }
-                    context_->mutableModel().history().forget(subString);
+                    context_->mutableModel().history().forget(subString.first);
                     reset();
                     return true;
                 }
@@ -430,12 +553,12 @@ bool TableState::handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event) {
     if (needUpdate) {
         auto &inputPanel = ic_->inputPanel();
         inputPanel.reset();
-        if (length == 0 || length == utf8::INVALID_LENGTH) {
+        if (lookupPinyinString_.empty()) {
             inputPanel.setAuxUp(Text(
                 _("Please use this functionality after typing some text.")));
         } else {
             auto subString = getSubString();
-            auto chr = utf8::getChar(subString);
+            auto chr = utf8::getChar(subString.first);
 
             if (mode_ == TableMode::LookupPinyin) {
                 Text auxUp(_("Use Left and Right to select character: "));
@@ -453,12 +576,13 @@ bool TableState::handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event) {
                 Text auxDown;
                 if (lookupPinyinIndex_ >= 1) {
                     std::string result;
-                    if (context_->dict().generate(subString, result)) {
+                    if (context_->dict().generateWithHint(
+                            subString.first, subString.second, result)) {
                         auxDown.append(
-                            fmt::format(_("{0}: {1}"), subString,
+                            fmt::format(_("{0}: {1}"), subString.first,
                                         context_->customHint(result)));
-                        auto flag =
-                            context_->dict().wordExists(result, subString);
+                        auto flag = context_->dict().wordExists(
+                            result, subString.first);
                         if (flag == libime::PhraseFlag::Invalid) {
                             auxUp.append(_("Press space to insert."));
                         }
@@ -470,7 +594,7 @@ bool TableState::handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event) {
                         }
                     } else {
                         auxDown.append(fmt::format(
-                            _("{0}: No corresponding code."), subString));
+                            _("{0}: No corresponding code."), subString.first));
                     }
                     auxDown.append(" ");
                 }
@@ -494,29 +618,64 @@ bool TableState::handleLookupPinyinOrModifyDictionaryMode(KeyEvent &event) {
     return true;
 }
 
+void TableState::forgetCandidateWord(size_t idx) {
+    auto code = TableContext::code(context_->candidates()[idx]);
+    if (!code.empty()) {
+        auto word = context_->candidates()[idx].toString();
+        context_->mutableDict().removeWord(code, word);
+        context_->mutableModel().history().forget(word);
+    }
+    context_->clear();
+    mode_ = TableMode::Normal;
+
+    updateUI();
+}
+
 void TableState::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
     bool needUpdate = false;
-    auto inputContext = event.inputContext();
+    auto *inputContext = event.inputContext();
     bool lastIsPunc = lastIsPunc_;
-    auto context = this->context(&entry);
+    auto *context = updateContext(&entry);
     if (!context) {
         return;
     }
 
-    if ((mode_ != TableMode::Normal || context_->size()) &&
-        event.key().check(FcitxKey_Escape)) {
+    const auto &config = context->config();
+    // 2nd/3rd selection is allowed to be modifier only, handle them before we
+    // skip the release.
+    if (handle2nd3rdCandidate(config, event)) {
+        return;
+    }
+
+    // by pass all key release and by pass all modifier
+    if (event.isRelease() || event.key().isModifier()) {
+        return;
+    }
+
+    if (event.key().check(FcitxKey_Escape)) {
+        if (mode_ != TableMode::Normal) {
+            event.filterAndAccept();
+        }
+        if (!isContextEmpty()) {
+            event.filterAndAccept();
+        }
         reset();
-        return event.filterAndAccept();
+        if (event.accepted()) {
+            return;
+        }
     }
 
     lastIsPunc_ = false;
-    auto &config = context->config();
 
     if (handleCandidateList(config, event)) {
         return;
     }
 
     if (handlePinyinMode(event)) {
+        return;
+    }
+
+    if (handleForgetWord(event)) {
         return;
     }
 
@@ -527,34 +686,71 @@ void TableState::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
     auto chr = Key::keySymToUnicode(event.key().sym());
     if (!event.key().hasModifier() && chr && context->isValidInput(chr)) {
         auto str = utf8::UCS4ToUTF8(chr);
-        context->type(str);
-        if (context->candidates().empty() && context->currentCode() == str) {
+        {
+            CommitAfterSelectWrapper commitAfterSelectRAII(this);
+            context->type(str);
+        }
+        if (context->candidates().empty() &&
+            ((*config.commitAfterSelect && context->currentCode() == str) ||
+             (!*config.commitAfterSelect && context->userInput() == str))) {
             // This means it is not a valid start, make it go through the punc.
             context->backspace();
         } else {
             event.filterAndAccept();
         }
-    } else if (context->size()) {
+    } else if (!isContextEmpty()) {
         if (event.key().check(FcitxKey_Return, KeyState::Shift)) {
-            inputContext->commitString(context->userInput());
-            context->clear();
+            if (*config.commitAfterSelect) {
+                commitBuffer(true);
+            } else {
+                inputContext->commitString(context->userInput());
+                context->clear();
+            }
             event.filterAndAccept();
         } else if (event.key().check(FcitxKey_Tab)) {
-            // if it gonna commit something
-            context->autoSelect();
+            {
+                CommitAfterSelectWrapper commitAfterSelectRAII(this);
+                autoSelectCandidate();
+            }
             if (context->selected()) {
                 commitBuffer(false);
             }
             event.filterAndAccept();
-        } else if (event.key().check(FcitxKey_Return) && !context->selected()) {
-            commitBuffer(true);
-            event.filterAndAccept();
-        } else if (event.key().check(FcitxKey_BackSpace)) {
-            // Discard the last segement if it is selected.
-            if (context->selected()) {
-                auto length =
-                    context->selectedSegmentLength(context->selectedSize() - 1);
-                context->erase(context->size() - length, context->size());
+        } else if (event.key().sym() == FcitxKey_Return) {
+            if (*config.commitAfterSelect) {
+                if (!context->selected()) {
+                    event.filterAndAccept();
+                }
+                commitBuffer(true);
+            } else {
+                inputContext->commitString(context->userInput());
+                context->clear();
+                event.filterAndAccept();
+            }
+        } else if (event.key().check(FcitxKey_BackSpace) ||
+                   event.key().check(FcitxKey_BackSpace, KeyState::Ctrl)) {
+            // Commit the last segment if it is selected.
+            if (*config.commitAfterSelect && context->selected() &&
+                (std::get<bool>(
+                     context->selectedSegment(context->selectedSize() - 1)) ||
+                 *config.commitInvalidSegment)) {
+                commitBuffer(false);
+                updateUI();
+                return;
+            }
+            if (event.key().check(FcitxKey_BackSpace, KeyState::Ctrl)) {
+                // For non-commitAfterSelect, remove the whole segment, or the
+                // current code.
+                if (!*config.commitAfterSelect && context->selected()) {
+                    auto cursor = context->cursor();
+                    context_->erase(cursor - context->selectedSegmentLength(
+                                                 context->selectedSize() - 1),
+                                    cursor);
+                } else {
+                    auto cursor = context->cursor();
+                    context_->erase(
+                        cursor - utf8::length(context_->currentCode()), cursor);
+                }
             } else {
                 context->backspace();
             }
@@ -564,19 +760,11 @@ void TableState::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
             // if it gonna commit something
             commitBuffer(true);
             needUpdate = true;
-            event.filter();
         } else if (!context->selected()) {
             // key to handle when it is not empty.
             if (event.key().check(FcitxKey_space)) {
-                auto candidateList = ic_->inputPanel().candidateList();
-                if (candidateList && candidateList->size()) {
-                    int idx = candidateList->cursorIndex();
-                    if (idx < 0) {
-                        idx = 0;
-                    }
-                    candidateList->candidate(idx).select(ic_);
-                    return event.filterAndAccept();
-                }
+                autoSelectCandidate();
+                return event.filterAndAccept();
             }
         }
     } else if (event.key().check(FcitxKey_BackSpace) && lastIsPunc) {
@@ -588,7 +776,7 @@ void TableState::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
             cancelLastEvent_ = engine_->instance()->eventLoop().addTimeEvent(
                 CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 300, 0,
                 [this, ref, puncStr](EventSourceTime *, uint64_t) {
-                    if (auto inputContext = ref.get()) {
+                    if (auto *inputContext = ref.get()) {
                         inputContext->commitString(puncStr);
                     }
                     cancelLastEvent_.reset();
@@ -598,90 +786,228 @@ void TableState::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
             return;
         }
     }
-    if (!event.filtered()) {
+
+    do {
+        if (event.filtered()) {
+            break;
+        }
+        if (*context->config().commitAfterSelect && isContextEmpty()) {
+            if (event.key().check(FcitxKey_Delete) ||
+                event.key().check(FcitxKey_BackSpace) ||
+                event.key().check(FcitxKey_Delete, KeyState::Ctrl) ||
+                event.key().check(FcitxKey_BackSpace, KeyState::Ctrl) ||
+                event.key().isCursorMove() ||
+                event.key().sym() == FcitxKey_Return) {
+                commitBuffer(false);
+            }
+        }
+
         if (event.key().hasModifier() || !chr) {
-            return;
+            // Handle quick phrase with modifier
+            if (event.key().check(*config.quickphrase) &&
+                engine_->quickphrase()) {
+                engine_->quickphrase()->call<IQuickPhrase::trigger>(
+                    inputContext, "", "", "", "", Key());
+                event.filterAndAccept();
+                return;
+            }
+            break;
         }
-        // if it gonna commit something
-        context->autoSelect();
-        if (context->selected()) {
-            commitBuffer(false);
-            needUpdate = true;
+        // if current key will produce some string, select the candidate.
+        if (!autoSelectCandidate()) {
+            commitBuffer(true);
         }
-        auto punc = engine_->punctuation()->call<IPunctuation::pushPunctuation>(
-            entry.languageCode(), inputContext, chr);
+        std::string punc, puncAfter;
+        if (!*context->config().ignorePunc || event.key().isKeyPad()) {
+            std::tie(punc, puncAfter) =
+                engine_->punctuation()->call<IPunctuation::pushPunctuationV2>(
+                    entry.languageCode(), inputContext, chr);
+        }
         if (event.key().check(*config.quickphrase) && engine_->quickphrase()) {
-            auto s = punc.size() ? punc : utf8::UCS4ToUTF8(chr);
-            auto alt = punc.size() ? utf8::UCS4ToUTF8(chr) : "";
+            auto s = !punc.empty() ? punc + puncAfter : utf8::UCS4ToUTF8(chr);
+            auto alt = !punc.empty() ? utf8::UCS4ToUTF8(chr) : "";
             std::string text;
-            if (s.size()) {
+            if (!s.empty()) {
                 text += alt + _(" for ") + s;
             }
-            if (alt.size()) {
+            if (!alt.empty()) {
                 text += _(" Return for ") + alt;
             }
             engine_->quickphrase()->call<IQuickPhrase::trigger>(
-                inputContext, text, "", s, alt, Key(FcitxKey_semicolon));
+                inputContext, text, "", s, alt, *config.quickphrase);
             event.filterAndAccept();
             return;
         }
 
-        if (punc.size()) {
+        if (!punc.empty()) {
             event.filterAndAccept();
-            inputContext->commitString(punc);
+            inputContext->commitString(punc + puncAfter);
+            if (size_t length = utf8::lengthValidated(puncAfter);
+                length != 0 && length != utf8::INVALID_LENGTH) {
+                for (size_t i = 0; i < length; i++) {
+                    inputContext->forwardKey(Key(FcitxKey_Left));
+                }
+            }
         }
         lastIsPunc_ = true;
-    }
+    } while (0);
 
     if ((event.filtered() && event.accepted()) || needUpdate) {
         updateUI();
     }
 }
 
+bool TableState::handle2nd3rdCandidate(const TableConfig &config,
+                                       KeyEvent &event) {
+    auto *inputContext = event.inputContext();
+    auto candidateList = inputContext->inputPanel().candidateList();
+    if (!candidateList) {
+        return false;
+    }
+
+    struct {
+        const KeyList &list;
+        int selection;
+    } keyHandlers[] = {
+        // Index starts with 0
+        {*config.secondCandidate, 1},
+        {*config.thirdCandidate, 2},
+    };
+
+    int keyReleased = keyReleased_;
+    int keyReleasedIndex = keyReleasedIndex_;
+    // Keep these two values, and reset them in the state
+    keyReleased_ = -1;
+    keyReleasedIndex_ = -2;
+    const bool isModifier = event.origKey().isModifier();
+    if (event.isRelease()) {
+        int idx = 0;
+        for (auto &keyHandler : keyHandlers) {
+            if (keyReleased == idx &&
+                keyReleasedIndex ==
+                    event.origKey().keyListIndex(keyHandler.list)) {
+                if (isModifier) {
+                    if (keyHandler.selection < candidateList->size()) {
+                        candidateList->candidate(keyHandler.selection)
+                            .select(inputContext);
+                    }
+                    event.filterAndAccept();
+                    return true;
+                }
+                event.filter();
+                return true;
+            }
+            idx++;
+        }
+    }
+
+    if (!event.filtered() && !event.isRelease()) {
+        int idx = 0;
+        for (auto &keyHandler : keyHandlers) {
+            auto keyIdx = event.origKey().keyListIndex(keyHandler.list);
+            if (keyIdx >= 0) {
+                keyReleased_ = idx;
+                keyReleasedIndex_ = keyIdx;
+                if (isModifier) {
+                    // don't forward to input method, but make it pass
+                    // through to client.
+                    event.filter();
+                    return true;
+                }
+                if (keyHandler.selection < candidateList->size()) {
+                    candidateList->candidate(keyHandler.selection)
+                        .select(inputContext);
+                }
+                event.filterAndAccept();
+                return true;
+            }
+            idx++;
+        }
+    }
+    return false;
+}
+
 void TableState::commitBuffer(bool commitCode, bool noRealCommit) {
-    auto context = context_.get();
+    auto *context = context_.get();
     if (!context) {
         return;
     }
-    auto sentence = context->selectedSentence();
-    TABLE_DEBUG() << "TableState::commitBuffer " << sentence << " "
-                  << context->selectedSize();
-    for (size_t i = 0; i < context->selectedSize(); i++) {
-        auto seg = context->selectedSegment(i);
-        if (std::get<bool>(seg)) {
-            pushLastCommit(std::get<std::string>(seg));
+
+    if (mode_ == TableMode::Pinyin && !noRealCommit) {
+        auto commit = pinyinModePrefix_ + pinyinModeBuffer_.userInput();
+        if (!commit.empty()) {
+            ic_->commitString(commit);
         }
+        reset();
+        return;
+    }
+
+    std::string sentence;
+    if (!*context->config().commitAfterSelect) {
+        sentence = commitSegements(0, context->selectedSize());
     }
 
     if (commitCode) {
         sentence += context->currentCode();
     }
+    TABLE_DEBUG() << "TableState::commitBuffer " << sentence << " "
+                  << context->selectedSize();
 
-    if (!noRealCommit) {
+    if (!noRealCommit && !sentence.empty()) {
         ic_->commitString(sentence);
     }
-    if (!ic_->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
+    // If commitAfterSelect && !useContextBasedOrder, learnLast will be used.
+    if (!ic_->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive) &&
+        !(*context->config().commitAfterSelect &&
+          !*context->config().useContextBasedOrder)) {
         context->learn();
     }
     context->clear();
 }
 
-void TableState::updateUI() {
-    ic_->inputPanel().reset();
-
-    auto context = context_.get();
+void TableState::commitAfterSelect(int commitFrom) {
+    auto *context = context_.get();
     if (!context) {
         return;
     }
-    auto &config = context->config();
-    if (context->userInput().size()) {
+
+    const auto &config = context->config();
+    if (!*config.commitAfterSelect) {
+        return;
+    }
+    std::string sentence =
+        commitSegements(commitFrom, context_->selectedSize());
+    if (sentence.empty()) {
+        return;
+    }
+    ic_->commitString(sentence);
+    if (!*config.useContextBasedOrder) {
+        if (!ic_->capabilityFlags().testAny(
+                CapabilityFlag::PasswordOrSensitive)) {
+            context->learnLast();
+        }
+    }
+}
+
+void TableState::updateUI() {
+    ic_->inputPanel().reset();
+
+    auto *context = context_.get();
+    if (!context) {
+        return;
+    }
+    const auto &config = context->config();
+    if (!context->userInput().empty()) {
         auto candidates = context->candidates();
         auto &inputPanel = ic_->inputPanel();
-        if (context->candidates().size()) {
+        if (!candidates.empty()) {
             auto candidateList = std::make_unique<CommonCandidateList>();
             size_t idx = 0;
+            candidateList->setLayoutHint(*config.candidateLayoutHint);
             candidateList->setCursorPositionAfterPaging(
                 CursorPositionAfterPaging::ResetToFirst);
+            candidateList->setSelectionKey(*config.selection);
+            candidateList->setPageSize(*config.pageSize);
 
             for (const auto &candidate : candidates) {
                 auto candidateString = candidate.toString();
@@ -700,16 +1026,33 @@ void TableState::updateUI() {
                                                           std::move(text), idx);
                 idx++;
             }
-            candidateList->setSelectionKey(*config.selection);
-            candidateList->setPageSize(*config.pageSize);
-            candidateList->setGlobalCursorIndex(0);
+            if (candidateList->size()) {
+                candidateList->setGlobalCursorIndex(0);
+            }
             inputPanel.setCandidateList(std::move(candidateList));
         }
-        Text preeditText = context->preeditText();
-        if (ic_->capabilityFlags().test(CapabilityFlag::Preedit)) {
-            inputPanel.setClientPreedit(preeditText);
+        const bool useClientPreedit =
+            ic_->capabilityFlags().test(CapabilityFlag::Preedit);
+        if (*config.displayCustomHint && context->dict().hasCustomPrompt()) {
+            if (useClientPreedit) {
+                inputPanel.setClientPreedit(context->preeditText(
+                    /*hint=*/false, /*clientPreedit=*/true));
+            }
+            inputPanel.setPreedit(
+                context->preeditText(/*hint=*/true, /*clientPreedit=*/false));
         } else {
-            inputPanel.setPreedit(preeditText);
+            Text preeditText =
+                context->preeditText(/*hint=*/false, useClientPreedit);
+            if (useClientPreedit) {
+                inputPanel.setClientPreedit(preeditText);
+            } else {
+                inputPanel.setPreedit(preeditText);
+            }
+        }
+        if (mode_ == TableMode::ForgetWord) {
+            inputPanel.setPreedit(Text());
+            inputPanel.setAuxUp(
+                Text(_("Select candidate to be removed from history:")));
         }
     }
     ic_->updatePreedit();

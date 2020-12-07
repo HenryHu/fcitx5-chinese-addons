@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "punctuation.h"
 #include "notifications_public.h"
 #include <boost/iostreams/device/file_descriptor.hpp>
@@ -38,8 +26,8 @@
 using namespace fcitx;
 
 namespace {
-static const std::string emptyString;
-static const std::pair<std::string, std::string> emptyStringPair;
+const std::string emptyString;
+const std::pair<std::string, std::string> emptyStringPair;
 } // namespace
 
 bool dontConvertWhenEn(uint32_t c) { return c == '.' || c == ','; }
@@ -111,32 +99,40 @@ Punctuation::Punctuation(Instance *instance)
 
     commitConn_ = instance_->connect<Instance::CommitFilter>(
         [this](InputContext *ic, const std::string &sentence) {
-            auto state = ic->propertyFor(&factory_);
+            auto *state = ic->propertyFor(&factory_);
             // Though sentence is utf8, we only check ascii.
-            if (sentence.size() && (charutils::isupper(sentence.back()) ||
-                                    charutils::islower(sentence.back()) ||
-                                    charutils::isdigit(sentence.back()))) {
+            if (!sentence.empty() && (charutils::isupper(sentence.back()) ||
+                                      charutils::islower(sentence.back()) ||
+                                      charutils::isdigit(sentence.back()))) {
                 state->lastIsEngOrDigit_ = sentence.back();
             } else {
                 state->lastIsEngOrDigit_ = '\0';
             }
         });
-    keyEventConn_ = instance_->connect<Instance::KeyEventResult>(
-        [this](const KeyEvent &event) {
-            auto state = event.inputContext()->propertyFor(&factory_);
-            if (event.isRelease()) {
-                return;
+    auto processKeyEvent = [this](const KeyEventBase &event) {
+        const auto &keyEvent = static_cast<const ForwardKeyEvent &>(event);
+        auto *state = keyEvent.inputContext()->propertyFor(&factory_);
+        if (keyEvent.isRelease()) {
+            return;
+        }
+        if (!event.accepted()) {
+            if (keyEvent.key().isUAZ() || keyEvent.key().isLAZ() ||
+                keyEvent.key().isDigit()) {
+                state->lastIsEngOrDigit_ =
+                    Key::keySymToUnicode(keyEvent.key().sym());
+            } else {
+                state->lastIsEngOrDigit_ = '\0';
             }
-            if (!event.accepted()) {
-                if (event.key().isUAZ() || event.key().isLAZ() ||
-                    event.key().isDigit()) {
-                    state->lastIsEngOrDigit_ =
-                        Key::keySymToUnicode(event.key().sym());
-                } else {
-                    state->lastIsEngOrDigit_ = '\0';
-                }
-            }
-        });
+        }
+    };
+    keyEventConn_ =
+        instance_->connect<Instance::KeyEventResult>(processKeyEvent);
+    eventWatchers_.emplace_back(instance_->watchEvent(
+        EventType::InputContextForwardKey, EventWatcherPhase::PostInputMethod,
+        [processKeyEvent](Event &event) {
+            auto &keyEvent = static_cast<ForwardKeyEvent &>(event);
+            processKeyEvent(keyEvent);
+        }));
     eventWatchers_.emplace_back(instance_->watchEvent(
         EventType::InputContextKeyEvent, EventWatcherPhase::PostInputMethod,
         [this](Event &event) {
@@ -149,7 +145,7 @@ Punctuation::Punctuation(Instance *instance)
                 setEnabled(!enabled(), keyEvent.inputContext());
                 if (notifications()) {
                     notifications()->call<INotifications::showTip>(
-                        "fcitx-punc-toggle", "fcitx",
+                        "fcitx-punc-toggle", _("Punctuation"),
                         enabled() ? "fcitx-punc-active" : "fcitx-punc-inactive",
                         _("Punctuation"),
                         enabled() ? _("Full width punctuation is enabled.")
@@ -163,8 +159,8 @@ Punctuation::Punctuation(Instance *instance)
         EventType::InputContextFocusIn, EventWatcherPhase::PostInputMethod,
         [this](Event &event) {
             auto &icEvent = static_cast<InputContextEvent &>(event);
-            auto ic = icEvent.inputContext();
-            auto state = ic->propertyFor(&factory_);
+            auto *ic = icEvent.inputContext();
+            auto *state = ic->propertyFor(&factory_);
             if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
                 state->mayRebuildStateFromSurroundingText_ = true;
             }
@@ -173,8 +169,8 @@ Punctuation::Punctuation(Instance *instance)
         EventType::InputContextReset, EventWatcherPhase::PostInputMethod,
         [this](Event &event) {
             auto &icEvent = static_cast<InputContextEvent &>(event);
-            auto ic = icEvent.inputContext();
-            auto state = ic->propertyFor(&factory_);
+            auto *ic = icEvent.inputContext();
+            auto *state = ic->propertyFor(&factory_);
             state->lastIsEngOrDigit_ = 0;
             // Backup the state.
             state->notConvertedBackup_ = state->notConverted_;
@@ -190,8 +186,8 @@ Punctuation::Punctuation(Instance *instance)
         EventType::InputContextSurroundingTextUpdated,
         EventWatcherPhase::PostInputMethod, [this](Event &event) {
             auto &icEvent = static_cast<InputContextEvent &>(event);
-            auto ic = icEvent.inputContext();
-            auto state = ic->propertyFor(&factory_);
+            auto *ic = icEvent.inputContext();
+            auto *state = ic->propertyFor(&factory_);
             // Enable to rebuild punctuation state from surrounding text.
             if (state->mayRebuildStateFromSurroundingText_) {
                 state->mayRebuildStateFromSurroundingText_ = false;
@@ -205,7 +201,7 @@ Punctuation::Punctuation(Instance *instance)
                 return;
             }
             // We need text before the cursor.
-            auto &text = ic->surroundingText().text();
+            const auto &text = ic->surroundingText().text();
             auto cursor = ic->surroundingText().cursor();
             auto length = utf8::lengthValidated(text);
             if (length == utf8::INVALID_LENGTH) {
@@ -263,7 +259,10 @@ Punctuation::~Punctuation() {}
 
 void Punctuation::reloadConfig() {
     readAsIni(config_, "conf/punctuation.conf");
+    populateConfig();
+}
 
+void Punctuation::populateConfig() {
     auto files = StandardPath::global().multiOpen(StandardPath::Type::PkgData,
                                                   "punctuation", O_RDONLY,
                                                   filter::Prefix("punc.mb."));
@@ -308,30 +307,64 @@ const std::string &Punctuation::pushPunctuation(const std::string &language,
     if (!enabled()) {
         return emptyString;
     }
-    auto state = ic->propertyFor(&factory_);
-    if (state->lastIsEngOrDigit_ && dontConvertWhenEn(unicode)) {
+    auto *state = ic->propertyFor(&factory_);
+    if (state->lastIsEngOrDigit_ && *config_.halfWidthPuncAfterLatinOrNumber &&
+        dontConvertWhenEn(unicode)) {
         state->notConverted_ = unicode;
         return emptyString;
-    } else {
-        auto iter = profiles_.find(language);
-        if (iter == profiles_.end()) {
-            return emptyString;
-        }
-        auto &result = getPunctuation(language, unicode);
-        state->notConverted_ = 0;
-        if (result.second.empty()) {
-            return result.first;
-        } else {
-            auto iter = state->lastPuncStack_.find(unicode);
-            if (iter != state->lastPuncStack_.end()) {
-                state->lastPuncStack_.erase(iter);
-                return result.second;
-            } else {
-                state->lastPuncStack_.emplace(unicode, result.first);
-                return result.first;
-            }
-        }
     }
+    auto iter = profiles_.find(language);
+    if (iter == profiles_.end()) {
+        return emptyString;
+    }
+    const auto &result = getPunctuation(language, unicode);
+    state->notConverted_ = 0;
+    if (result.second.empty()) {
+        return result.first;
+    }
+
+    auto puncIter = state->lastPuncStack_.find(unicode);
+    if (puncIter != state->lastPuncStack_.end()) {
+        state->lastPuncStack_.erase(puncIter);
+        return result.second;
+    }
+    state->lastPuncStack_.emplace(unicode, result.first);
+    return result.first;
+}
+
+std::pair<std::string, std::string>
+Punctuation::pushPunctuationV2(const std::string &language, InputContext *ic,
+                               uint32_t unicode) {
+    if (!enabled()) {
+        return {emptyString, emptyString};
+    }
+    auto *state = ic->propertyFor(&factory_);
+    if (state->lastIsEngOrDigit_ && *config_.halfWidthPuncAfterLatinOrNumber &&
+        dontConvertWhenEn(unicode)) {
+        state->notConverted_ = unicode;
+        return {emptyString, emptyString};
+    }
+    auto iter = profiles_.find(language);
+    if (iter == profiles_.end()) {
+        return {emptyString, emptyString};
+    }
+    const auto &result = getPunctuation(language, unicode);
+    state->notConverted_ = 0;
+    if (result.second.empty()) {
+        return {result.first, emptyString};
+    }
+
+    if (*config_.typePairedPunctuationTogether) {
+        return {result.first, result.second};
+    }
+
+    auto puncIter = state->lastPuncStack_.find(unicode);
+    if (puncIter != state->lastPuncStack_.end()) {
+        state->lastPuncStack_.erase(puncIter);
+        return {result.second, emptyString};
+    }
+    state->lastPuncStack_.emplace(unicode, result.first);
+    return {result.first, emptyString};
 }
 
 const std::string &Punctuation::cancelLast(const std::string &language,
@@ -339,9 +372,9 @@ const std::string &Punctuation::cancelLast(const std::string &language,
     if (!enabled()) {
         return emptyString;
     }
-    auto state = ic->propertyFor(&factory_);
+    auto *state = ic->propertyFor(&factory_);
     if (dontConvertWhenEn(state->notConverted_)) {
-        auto &result = getPunctuation(language, state->notConverted_);
+        const auto &result = getPunctuation(language, state->notConverted_);
         state->notConverted_ = 0;
         return result.first;
     }

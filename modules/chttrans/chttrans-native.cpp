@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "chttrans-native.h"
 #include "config.h"
 #include <boost/iostreams/device/file_descriptor.hpp>
@@ -24,13 +12,11 @@
 #include <fcitx-utils/utf8.h>
 #include <fcntl.h>
 
-#define TABLE_GBKS2T "data/gbks2t.tab"
+#define TABLE_GBKS2T "chttrans/gbks2t.tab"
 
 using namespace fcitx;
 
-typedef std::unique_ptr<FILE, decltype(&std::fclose)> ScopedFILE;
-
-bool NativeBackend::loadOnce() {
+bool NativeBackend::loadOnce(const ChttransConfig &) {
     auto file = StandardPath::global().open(StandardPath::Type::PkgData,
                                             TABLE_GBKS2T, O_RDONLY);
     if (file.fd() < 0) {
@@ -70,7 +56,7 @@ std::string convert(const std::unordered_map<uint32_t, std::string> &transMap,
                     const std::string &strHZ) {
     auto len = utf8::length(strHZ);
     std::string result;
-    auto ps = strHZ.c_str();
+    const auto *ps = strHZ.c_str();
     for (size_t i = 0; i < len; ++i) {
         uint32_t wc;
         char *nps;

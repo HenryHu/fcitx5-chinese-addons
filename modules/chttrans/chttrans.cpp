@@ -1,24 +1,11 @@
-//
-// Copyright (C) 2016~2016 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2016-2016 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 
 #include "chttrans.h"
-#include "config.h"
 #include <fcitx-config/iniparser.h>
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/standardpath.h>
@@ -39,8 +26,8 @@ using namespace fcitx;
 static ChttransIMType inputMethodType(const InputMethodEntry &entry) {
     if (entry.languageCode() == "zh_CN") {
         return ChttransIMType::Simp;
-    } else if (entry.languageCode() == "zh_HK" ||
-               entry.languageCode() == "zh_TW") {
+    }
+    if (entry.languageCode() == "zh_HK" || entry.languageCode() == "zh_TW") {
         return ChttransIMType::Trad;
     }
     return ChttransIMType::Other;
@@ -64,9 +51,9 @@ Chttrans::Chttrans(fcitx::Instance *instance) : instance_(instance) {
             if (keyEvent.isRelease()) {
                 return;
             }
-            auto ic = keyEvent.inputContext();
-            auto engine = instance_->inputMethodEngine(ic);
-            auto entry = instance_->inputMethodEntry(ic);
+            auto *ic = keyEvent.inputContext();
+            auto *engine = instance_->inputMethodEngine(ic);
+            const auto *entry = instance_->inputMethodEntry(ic);
             if (!engine || !entry ||
                 !toggleAction_.isParent(&ic->statusArea())) {
                 return;
@@ -80,11 +67,12 @@ Chttrans::Chttrans(fcitx::Instance *instance) : instance_(instance) {
                 bool tradEnabled = convertType(ic) == ChttransIMType::Trad;
                 if (notifications()) {
                     notifications()->call<INotifications::showTip>(
-                        "fcitx-chttrans-toggle", "fcitx",
+                        "fcitx-chttrans-toggle",
+                        _("Simplified and Traditional Chinese Translation"),
                         tradEnabled ? "fcitx-chttrans-active"
                                     : "fcitx-chttrans-inactive",
-                        tradEnabled ? _("Traditional Chinese")
-                                    : _("Simplified Chinese"),
+                        tradEnabled ? _("Switch to Traditional Chinese")
+                                    : _("Switch to Simplified Chinese"),
                         tradEnabled ? _("Traditional Chinese is enabled.")
                                     : _("Simplified Chinese is enabled."),
                         -1);
@@ -149,8 +137,8 @@ Chttrans::Chttrans(fcitx::Instance *instance) : instance_(instance) {
 }
 
 void Chttrans::toggle(InputContext *ic) {
-    auto engine = instance_->inputMethodEngine(ic);
-    auto entry = instance_->inputMethodEntry(ic);
+    auto *engine = instance_->inputMethodEngine(ic);
+    const auto *entry = instance_->inputMethodEntry(ic);
     if (!engine || !entry || !toggleAction_.isParent(&ic->statusArea())) {
         return;
     }
@@ -163,45 +151,63 @@ void Chttrans::toggle(InputContext *ic) {
     } else {
         enabledIM_.insert(entry->uniqueName());
     }
+    syncToConfig();
     toggleAction_.update(ic);
 }
 
 void Chttrans::reloadConfig() {
     readAsIni(config_, "conf/chttrans.conf");
+    populateConfig();
+}
+
+void Chttrans::populateConfig() {
     enabledIM_.clear();
     enabledIM_.insert(config_.enabledIM.value().begin(),
                       config_.enabledIM.value().end());
+    for (const auto &backend : backends_) {
+        if (backend.second->loaded()) {
+            backend.second->updateConfig(config_);
+        }
+    }
 }
 
-void Chttrans::save() {
+void Chttrans::syncToConfig() {
     std::vector<std::string> values_;
     for (const auto &id : enabledIM_) {
         values_.push_back(id);
     }
     config_.enabledIM.setValue(std::move(values_));
+}
 
+void Chttrans::save() {
+    syncToConfig();
     safeSaveAsIni(config_, "conf/chttrans.conf");
 }
 
 std::string Chttrans::convert(ChttransIMType type, const std::string &str) {
-    auto iter = backends_.find(config_.engine.value());
+#ifdef ENABLE_OPENCC
+    auto engine = config_.engine.value();
+#else
+    auto engine = ChttransEngine::Native;
+#endif
+
+    auto iter = backends_.find(engine);
     if (iter == backends_.end()) {
         iter = backends_.find(ChttransEngine::Native);
     }
-    if (iter == backends_.end() || !iter->second->load()) {
+    if (iter == backends_.end() || !iter->second->load(config_)) {
         return str;
     }
 
     if (type == ChttransIMType::Trad) {
         return iter->second->convertSimpToTrad(str);
-    } else {
-        return iter->second->convertTradToSimp(str);
     }
+    return iter->second->convertTradToSimp(str);
 }
 
 bool Chttrans::needConvert(fcitx::InputContext *inputContext) {
-    auto engine = instance_->inputMethodEngine(inputContext);
-    auto entry = instance_->inputMethodEntry(inputContext);
+    auto *engine = instance_->inputMethodEngine(inputContext);
+    const auto *entry = instance_->inputMethodEntry(inputContext);
     if (!engine || !entry) {
         return false;
     }
@@ -214,8 +220,8 @@ bool Chttrans::needConvert(fcitx::InputContext *inputContext) {
 }
 
 ChttransIMType Chttrans::convertType(fcitx::InputContext *inputContext) {
-    auto engine = instance_->inputMethodEngine(inputContext);
-    auto entry = instance_->inputMethodEntry(inputContext);
+    auto *engine = instance_->inputMethodEngine(inputContext);
+    const auto *entry = instance_->inputMethodEntry(inputContext);
     if (!engine || !entry) {
         return ChttransIMType::Other;
     }
@@ -233,6 +239,7 @@ ChttransIMType Chttrans::convertType(fcitx::InputContext *inputContext) {
 
 class ChttransModuleFactory : public AddonFactory {
     AddonInstance *create(AddonManager *manager) override {
+        registerDomain("fcitx5-chinese-addons", FCITX_INSTALL_LOCALEDIR);
         return new Chttrans(manager->instance());
     }
 };

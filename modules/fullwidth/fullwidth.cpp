@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 
 #include "fullwidth.h"
 #include "notifications_public.h"
@@ -79,7 +67,7 @@ Fullwidth::Fullwidth(Instance *instance) : instance_(instance) {
                 setEnabled(!enabled_, keyEvent.inputContext());
                 if (notifications()) {
                     notifications()->call<INotifications::showTip>(
-                        "fcitx-fullwidth-toggle", "fcitx",
+                        "fcitx-fullwidth-toggle", _("Full width character"),
                         enabled_ ? "fcitx-fullwidth-active"
                                  : "fcitx-fullwidth-inactive",
                         _("Full width Character"),
@@ -100,7 +88,7 @@ Fullwidth::Fullwidth(Instance *instance) : instance_(instance) {
             }
             auto len = utf8::length(str);
             std::string result;
-            auto ps = str.c_str();
+            const auto *ps = str.c_str();
             for (size_t i = 0; i < len; ++i) {
                 uint32_t wc;
                 char *nps;
@@ -122,14 +110,13 @@ Fullwidth::Fullwidth(Instance *instance) : instance_(instance) {
 
 void Fullwidth::reloadConfig() { readAsIni(config_, "conf/fullwidth.conf"); }
 
-void Fullwidth::save() { safeSaveAsIni(config_, "conf/fullwidth.conf"); }
-
 bool Fullwidth::inWhiteList(InputContext *inputContext) const {
     return toggleAction_.isParent(&inputContext->statusArea());
 }
 
 class FullwidthModuleFactory : public AddonFactory {
     AddonInstance *create(AddonManager *manager) override {
+        registerDomain("fcitx5-chinese-addons", FCITX_INSTALL_LOCALEDIR);
         return new Fullwidth(manager->instance());
     }
 };

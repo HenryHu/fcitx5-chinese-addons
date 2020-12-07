@@ -1,23 +1,10 @@
-//
-// Copyright (C) 2012~2012 by Yichao Yu
-// yyc1992@gmail.com
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2012-2012 Yichao Yu <yyc1992@gmail.com>
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "stroke.h"
 
 #include <boost/algorithm/string.hpp>
@@ -67,6 +54,7 @@ bool Stroke::load() {
         }
         std::string token = tokens[0] + '|' + tokens[1];
         dict_.set(token, 1);
+        revserseDict_[tokens[1]] = tokens[0];
     }
 
     return true;
@@ -80,6 +68,7 @@ bool Stroke::load() {
 std::vector<std::pair<std::string, std::string>>
 Stroke::lookup(std::string_view input, int limit) {
     std::vector<std::pair<std::string, std::string>> result;
+    std::unordered_set<std::string> resultSet;
     using position_type = decltype(dict_)::position_type;
     struct LookupItem {
         position_type pos;
@@ -95,11 +84,41 @@ Stroke::lookup(std::string_view input, int limit) {
                         std::greater<LookupItem>>
         q;
 
+    // First lets check if the stroke is already a prefix of single word.
+    position_type onlyMatch = decltype(dict_)::NO_PATH;
+    size_t onlyMatchLength = 0;
+    auto addResult = [&result, &resultSet](std::string stroke, std::string hz) {
+        if (resultSet.insert(hz).second) {
+            result.emplace_back(std::move(stroke), std::move(hz));
+        }
+    };
+
+    if (dict_.foreach(input, [&onlyMatch, &onlyMatchLength](int32_t, size_t len,
+                                                            uint64_t pos) {
+            if (!decltype(dict_)::isNoPath(onlyMatch)) {
+                return false;
+            }
+            onlyMatch = pos;
+            onlyMatchLength = len;
+            return true;
+        })) {
+        if (decltype(dict_)::isValid(onlyMatch)) {
+            std::string buf;
+            dict_.suffix(buf, input.size() + onlyMatchLength, onlyMatch);
+            if (auto idx = buf.find_last_of('|'); idx != std::string::npos) {
+                addResult(buf.substr(idx + 1), buf.substr(0, idx));
+            }
+        }
+    }
+    if (result.size() >= static_cast<size_t>(limit)) {
+        return result;
+    }
+
     auto pushQueue = [&q](LookupItem &&item) {
         if (item.weight >= 10) {
             return;
         }
-        q.push(std::move(item));
+        q.push(item);
     };
 
     pushQueue(LookupItem{0, input, 0, 0});
@@ -110,17 +129,14 @@ Stroke::lookup(std::string_view input, int limit) {
         if (current.remain.empty()) {
             if (!dict_.foreach(
                     "|",
-                    [this, &result, &current, limit](int32_t, size_t len,
-                                                     uint64_t pos) {
+                    [this, &result, &current, limit,
+                     &addResult](int32_t, size_t len, uint64_t pos) {
                         std::string buf;
                         dict_.suffix(buf, current.length + 1 + len, pos);
-                        result.emplace_back(buf.substr(current.length + 1),
-                                            buf.substr(0, current.length));
-                        if (limit > 0 &&
-                            result.size() >= static_cast<size_t>(limit)) {
-                            return false;
-                        }
-                        return true;
+                        addResult(buf.substr(current.length + 1),
+                                  buf.substr(0, current.length));
+                        return !(limit > 0 &&
+                                 result.size() >= static_cast<size_t>(limit));
                     },
                     current.pos)) {
                 break;
@@ -128,7 +144,7 @@ Stroke::lookup(std::string_view input, int limit) {
         }
 
         // Deletion
-        if (current.remain.size() >= 1) {
+        if (!current.remain.empty()) {
             pushQueue(LookupItem{current.pos, current.remain.substr(1),
                                  current.weight + DELETION_WEIGHT,
                                  current.length});
@@ -167,6 +183,11 @@ Stroke::lookup(std::string_view input, int limit) {
     }
 
     return result;
+}
+
+std::string Stroke::reverseLookup(const std::string &hanzi) const {
+    auto iter = revserseDict_.find(hanzi);
+    return iter != revserseDict_.end() ? iter->second : std::string();
 }
 
 std::string Stroke::prettyString(const std::string &input) const {

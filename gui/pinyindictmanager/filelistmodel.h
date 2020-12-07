@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2013~2018 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2013-2018 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #ifndef _PINYINDICTMANAGER_FILELISTMODEL_H_
 #define _PINYINDICTMANAGER_FILELISTMODEL_H_
 
@@ -33,12 +21,19 @@ public:
     QVariant data(const QModelIndex &index,
                   int role = Qt::DisplayRole) const override;
     int rowCount(const QModelIndex &parent = QModelIndex()) const override;
+    bool setData(const QModelIndex &index, const QVariant &value,
+                 int role) override;
+    Qt::ItemFlags flags(const QModelIndex &index) const override;
 
     void loadFileList();
+    void save();
     int findFile(const QString &lastFileName);
 
+signals:
+    void changed();
+
 private:
-    QStringList fileList_;
+    QList<QPair<QString, bool>> fileList_;
 };
 
 } // namespace fcitx

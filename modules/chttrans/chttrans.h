@@ -1,24 +1,13 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #ifndef _CHTTRANS_CHTTRANS_H_
 #define _CHTTRANS_CHTTRANS_H_
 
+#include "config.h"
 #include "notifications_public.h"
 #include <fcitx-config/configuration.h>
 #include <fcitx-config/enum.h>
@@ -34,30 +23,44 @@ FCITX_CONFIG_ENUM(ChttransEngine, Native, OpenCC);
 
 FCITX_CONFIGURATION(
     ChttransConfig,
+#ifdef ENABLE_OPENCC
     fcitx::Option<ChttransEngine> engine{this, "Engine", _("Translate engine"),
                                          ChttransEngine::OpenCC};
+#endif
     fcitx::Option<fcitx::KeyList> hotkey{
         this, "Hotkey", _("Toggle key"), {fcitx::Key("Control+Shift+F")}};
     fcitx::HiddenOption<std::vector<std::string>> enabledIM{
-        this, "EnabledIM", _("Enabled Input Methods")};);
+        this, "EnabledIM", _("Enabled Input Methods")};
+#ifdef ENABLE_OPENCC
+    fcitx::Option<std::string> openCCS2TProfile{
+        this, "OpenCCS2TProfile",
+        "OpenCC profile for Simplified to Traditional", ""};
+    fcitx::Option<std::string> openCCT2SProfile{
+        this, "OpenCCT2SProfile",
+        "OpenCC profile for Traditional to Simplified", ""};
+#endif
+);
 
 enum class ChttransIMType { Simp, Trad, Other };
 
 class ChttransBackend {
 public:
     virtual ~ChttransBackend() {}
-    bool load() {
+    bool load(const ChttransConfig &config) {
         if (!loaded_) {
-            loadResult_ = loadOnce();
+            loadResult_ = loadOnce(config);
             loaded_ = true;
         }
         return loadResult_;
     }
     virtual std::string convertSimpToTrad(const std::string &) = 0;
     virtual std::string convertTradToSimp(const std::string &) = 0;
+    bool loaded() { return loaded_ && loadResult_; }
+
+    virtual void updateConfig(const ChttransConfig &) {}
 
 protected:
-    virtual bool loadOnce() = 0;
+    virtual bool loadOnce(const ChttransConfig &) = 0;
 
 private:
     bool loaded_ = false;
@@ -97,26 +100,22 @@ public:
     void setConfig(const fcitx::RawConfig &config) override {
         config_.load(config, true);
         fcitx::safeSaveAsIni(config_, "conf/chttrans.conf");
-        reloadConfig();
+        populateConfig();
     }
+    void populateConfig();
 
     bool needConvert(fcitx::InputContext *inputContext);
     ChttransIMType convertType(fcitx::InputContext *inputContext);
     std::string convert(ChttransIMType type, const std::string &str);
-    void toggle(fcitx::InputContext *inputContext);
+    void toggle(fcitx::InputContext *ic);
 
-    fcitx::AddonInstance *notifications() {
-        if (!notifications_) {
-            notifications_ =
-                instance_->addonManager().addon("notifications", true);
-        }
-        return notifications_;
-    }
+    FCITX_ADDON_DEPENDENCY_LOADER(notifications, instance_->addonManager());
 
 private:
+    void syncToConfig();
+
     fcitx::Instance *instance_;
     ChttransConfig config_;
-    fcitx::AddonInstance *notifications_ = nullptr;
     std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>
         eventHandler_;
     std::unordered_map<ChttransEngine, std::unique_ptr<ChttransBackend>,

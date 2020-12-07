@@ -1,38 +1,20 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "fetch.h"
+#include "cloudpinyin.h"
 #include <fcitx-utils/event.h>
+#include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/fs.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 using namespace fcitx;
 
-FetchThread::FetchThread(fcitx::UnixFD notifyFd)
-    : notifyFd_(std::move(notifyFd)) {
-    int pipefd[2];
-    if (pipe2(pipefd, O_NONBLOCK) < 0) {
-        throw std::runtime_error("Failed to create pipe");
-    }
-    selfPipeFd_[0].give(pipefd[0]);
-    selfPipeFd_[1].give(pipefd[1]);
-
+FetchThread::FetchThread(CloudPinyin *cloudPinyin) : cloudPinyin_(cloudPinyin) {
     curlm_ = curl_multi_init();
     curl_multi_setopt(curlm_, CURLMOPT_MAXCONNECTS, MAX_HANDLE);
     curl_multi_setopt(curlm_, CURLMOPT_SOCKETFUNCTION,
@@ -46,22 +28,22 @@ FetchThread::FetchThread(fcitx::UnixFD notifyFd)
 }
 
 FetchThread::~FetchThread() {
-    quit();
+    exit();
     thread_->join();
 
-    while (workingQueue.size()) {
-        auto queue = &workingQueue.front();
+    while (!workingQueue.empty()) {
+        auto *queue = &workingQueue.front();
         workingQueue.pop_front();
         curl_multi_remove_handle(curlm_, queue->curl());
         queue->release();
     }
-    while (pendingQueue.size()) {
-        auto queue = &pendingQueue.front();
+    while (!pendingQueue.empty()) {
+        auto *queue = &pendingQueue.front();
         pendingQueue.pop_front();
         queue->release();
     }
-    while (finishingQueue.size()) {
-        auto queue = &finishingQueue.front();
+    while (!finishingQueue.empty()) {
+        auto *queue = &finishingQueue.front();
         finishingQueue.pop_front();
         queue->release();
     }
@@ -107,7 +89,7 @@ void FetchThread::processMessages() {
             int curl_result = curl_message->data.result;
             void *p = nullptr;
             curl_easy_getinfo(curl_message->easy_handle, CURLINFO_PRIVATE, &p);
-            auto queue = static_cast<CurlQueue *>(p);
+            auto *queue = static_cast<CurlQueue *>(p);
             curl_multi_remove_handle(curlm_, queue->curl());
             queue->finish(curl_result);
             queue->remove();
@@ -127,12 +109,12 @@ void FetchThread::curl(curl_socket_t s, int action) {
     } else {
         auto iter = events_.find(s);
         if (iter == events_.end()) {
-            auto that_ = this;
+            auto *that_ = this;
             auto p = events_.emplace(
                 s, loop_->addIOEvent(
                        s, IOEventFlags(0),
                        [that_](EventSourceIO *, int fd, IOEventFlags flags) {
-                           auto that = that_;
+                           auto *that = that_;
                            // make sure "that" is valid since io handler may
                            // free itself.
                            that->handleIO(fd, flags);
@@ -155,7 +137,7 @@ void FetchThread::curl(curl_socket_t s, int action) {
 }
 
 int FetchThread::curlTimerCallback(CURLM *, long timeout_ms, void *user) {
-    auto self = static_cast<FetchThread *>(user);
+    auto *self = static_cast<FetchThread *>(user);
     self->curlTimer(timeout_ms);
     return 0;
 }
@@ -185,15 +167,14 @@ void FetchThread::curlTimer(long timeout_ms) {
 }
 
 void FetchThread::finished(CurlQueue *queue) {
-    std::lock_guard<std::mutex> lock(finishQueueLock);
-
-    finishingQueue.push_back(*queue);
-
-    char c = 0;
-    fs::safeWrite(notifyFd_.fd(), &c, sizeof(char));
+    {
+        std::lock_guard<std::mutex> lock(finishQueueLock);
+        finishingQueue.push_back(*queue);
+    }
+    cloudPinyin_->notifyFinished();
 }
 
-bool FetchThread::addRequest(SetupRequestCallback callback) {
+bool FetchThread::addRequest(const SetupRequestCallback &callback) {
     CurlQueue *queue = nullptr;
     for (auto &handle : handles_) {
         if (!handle.busy()) {
@@ -206,23 +187,36 @@ bool FetchThread::addRequest(SetupRequestCallback callback) {
     }
     callback(queue);
 
-    std::lock_guard<std::mutex> lock(pendingQueueLock);
-    pendingQueue.push_back(*queue);
+    {
+        std::lock_guard<std::mutex> lock(pendingQueueLock);
+        pendingQueue.push_back(*queue);
+    }
 
-    char c = 0;
-    fs::safeWrite(selfPipeFd_[1].fd(), &c, sizeof(c));
+    // Handle pending queue in fetch thread.
+    dispatcher_.schedule([this]() {
+        std::lock_guard<std::mutex> lock(pendingQueueLock);
+
+        while (!pendingQueue.empty()) {
+            auto *queue = &pendingQueue.front();
+            pendingQueue.pop_front();
+            curl_multi_add_handle(curlm_, queue->curl());
+            workingQueue.push_back(*queue);
+        }
+    });
     return true;
 }
 
-void FetchThread::quit() {
-    char c = 1;
-    fs::safeWrite(selfPipeFd_[1].fd(), &c, sizeof(c));
+void FetchThread::exit() {
+    dispatcher_.schedule([this]() {
+        loop_->exit();
+        dispatcher_.detach();
+    });
 }
 
 CurlQueue *FetchThread::popFinished() {
     std::lock_guard<std::mutex> lock(finishQueueLock);
     CurlQueue *result = nullptr;
-    if (finishingQueue.size()) {
+    if (!finishingQueue.empty()) {
         result = &finishingQueue.front();
         finishingQueue.pop_front();
     }
@@ -231,35 +225,8 @@ CurlQueue *FetchThread::popFinished() {
 
 void FetchThread::run() {
     loop_.reset(new fcitx::EventLoop);
-    std::unique_ptr<EventSourceIO> event(loop_->addIOEvent(
-        selfPipeFd_[0].fd(), IOEventFlag::In,
-        [this](EventSourceIO *, int, IOEventFlags) {
-            char c;
-            int r = 0;
-            bool endflag = false;
-            while ((r = fs::safeRead(selfPipeFd_[0].fd(), &c, sizeof(char))) >
-                   0) {
-                if (c == 1) {
-                    endflag = true;
-                }
-            }
-            if (r == 0 || endflag) {
-                loop_->quit();
-                return true;
-            }
 
-            std::lock_guard<std::mutex> lock(pendingQueueLock);
-
-            while (pendingQueue.size()) {
-                auto queue = &pendingQueue.front();
-                pendingQueue.pop_front();
-                curl_multi_add_handle(curlm_, queue->curl());
-                workingQueue.push_back(*queue);
-            }
-
-            return true;
-        }));
-
+    dispatcher_.attach(loop_.get());
     loop_->exec();
     // free events ahead of time
     timer_.reset();

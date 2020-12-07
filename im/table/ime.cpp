@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #include "ime.h"
 #include "config.h"
 #include <boost/iostreams/device/file_descriptor.hpp>
@@ -56,7 +44,6 @@ void populateOptions(libime::TableBasedDictionary *dict,
     options.setAutoSelect(*root.config->autoSelect);
     options.setAutoSelectLength(*root.config->autoSelectLength);
     options.setNoMatchAutoSelectLength(*root.config->noMatchAutoSelectLength);
-    options.setCommitRawInput(*root.config->commitRawInput);
     options.setMatchingKey(
         Key::keySymToUnicode(root.config->matchingKey->sym()));
     std::set<uint32_t> endKeys;
@@ -88,29 +75,42 @@ TableIME::requestDict(const std::string &name) {
     auto iter = tables_.find(name);
     if (iter == tables_.end()) {
         TABLE_DEBUG() << "Load table config for: " << name;
-        std::string filename = "inputmethod/";
-        filename.append(name.begin(), name.end());
-        filename += ".conf";
-        auto files = StandardPath::global().openAll(StandardPath::Type::PkgData,
-                                                    filename, O_RDONLY);
-        RawConfig rawConfig;
-        // reverse the order, so we end up parse user file at last.
-        for (const auto &file : files | boost::adaptors::reversed) {
-            readFromIni(rawConfig, file.fd());
-        }
-
         iter = tables_
                    .emplace(std::piecewise_construct, std::make_tuple(name),
                             std::make_tuple())
                    .first;
         auto &root = iter->second.root;
-        root.load(rawConfig);
+
+        std::string filename = stringutils::joinPath(
+            "inputmethod", stringutils::concat(name, ".conf"));
+        auto files = StandardPath::global().openAll(StandardPath::Type::PkgData,
+                                                    filename, O_RDONLY);
+        // reverse the order, so we end up parse user file at last.
+        for (const auto &file : files | boost::adaptors::reversed) {
+            RawConfig rawConfig;
+            readFromIni(rawConfig, file.fd());
+            root.load(rawConfig, true);
+        }
+
+        // So "Default" can be reset to current value.
+        root.syncDefaultValueToCurrent();
+
+        std::string customization =
+            stringutils::joinPath("table", stringutils::concat(name, ".conf"));
+        files = StandardPath::global().openAll(StandardPath::Type::PkgConfig,
+                                               customization, O_RDONLY);
+        // reverse the order, so we end up parse user file at last.
+        for (const auto &file : files | boost::adaptors::reversed) {
+            RawConfig rawConfig;
+            readFromIni(rawConfig, file.fd());
+            root.load(rawConfig, true);
+        }
 
         try {
             auto dict = std::make_unique<libime::TableBasedDictionary>();
             auto dictFile = StandardPath::global().open(
                 StandardPath::Type::PkgData, *root.config->file, O_RDONLY);
-            FCITX_LOG(Debug) << "Load table at: " << *root.config->file;
+            TABLE_DEBUG() << "Load table at: " << *root.config->file;
             if (dictFile.fd() < 0) {
                 throw std::runtime_error("Couldn't open file");
             }
@@ -124,7 +124,7 @@ TableIME::requestDict(const std::string &name) {
         } catch (const std::exception &) {
         }
 
-        if (auto dict = iter->second.dict.get()) {
+        if (auto *dict = iter->second.dict.get()) {
             try {
                 auto dictFile = StandardPath::global().openUser(
                     StandardPath::Type::PkgData,
@@ -138,14 +138,25 @@ TableIME::requestDict(const std::string &name) {
                 std::istream in(&buffer);
                 dict->loadUser(in);
             } catch (const std::exception &e) {
-                TABLE_ERROR() << e.what();
+                TABLE_DEBUG() << e.what();
             }
 
             populateOptions(dict, iter->second.root);
-            auto lmFile = lm_->languageModelFileForLanguage(
-                dict->tableOptions().languageCode());
+            std::shared_ptr<const libime::StaticLanguageModelFile> lmFile;
+            try {
+                if (*iter->second.root.config->useSystemLanguageModel) {
+                    lmFile = lm_->languageModelFileForLanguage(
+                        dict->tableOptions().languageCode());
+                }
+            } catch (...) {
+                TABLE_DEBUG()
+                    << "Load language model for "
+                    << dict->tableOptions().languageCode() << " failed.";
+            }
             iter->second.model =
                 std::make_unique<libime::UserLanguageModel>(lmFile);
+            iter->second.model->setUseOnlyUnigram(
+                !*iter->second.root.config->useContextBasedOrder);
 
             try {
                 auto dictFile = StandardPath::global().openUser(
@@ -159,7 +170,7 @@ TableIME::requestDict(const std::string &name) {
                 std::istream in(&buffer);
                 iter->second.model->load(in);
             } catch (const std::exception &e) {
-                TABLE_ERROR() << e.what();
+                TABLE_DEBUG() << e.what();
             }
         }
     }
@@ -179,13 +190,14 @@ void TableIME::updateConfig(const std::string &name, const RawConfig &config) {
     if (iter == tables_.end()) {
         return;
     }
-    iter->second.root.load(config, true);
+    iter->second.root.config.mutableValue()->load(config, true);
 
     if (iter->second.dict) {
         populateOptions(iter->second.dict.get(), iter->second.root);
     }
-    safeSaveAsIni(iter->second.root,
-                  stringutils::concat("inputmethod/", name, ".conf"));
+
+    safeSaveAsIni(iter->second.root, StandardPath::Type::PkgConfig,
+                  stringutils::concat("table/", name, ".conf"));
 }
 
 void TableIME::releaseUnusedDict(const std::unordered_set<std::string> &names) {
@@ -207,6 +219,9 @@ void TableIME::saveDict(const std::string &name) {
     }
     libime::TableBasedDictionary *dict = iter->second.dict.get();
     libime::UserLanguageModel *lm = iter->second.model.get();
+    if (!dict || !lm || !*iter->second.root.config->learning) {
+        return;
+    }
     auto fileName = stringutils::joinPath("table", name);
 
     StandardPath::global().safeSave(

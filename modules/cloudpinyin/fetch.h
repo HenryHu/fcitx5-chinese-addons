@@ -1,21 +1,9 @@
-//
-// Copyright (C) 2017~2017 by CSSlayer
-// wengxt@gmail.com
-//
-// This library is free software; you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as
-// published by the Free Software Foundation; either version 2.1 of the
-// License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; see the file COPYING. If not,
-// see <http://www.gnu.org/licenses/>.
-//
+/*
+ * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ */
 #ifndef _CLOUDPINYIN_FETCH_H_
 #define _CLOUDPINYIN_FETCH_H_
 
@@ -23,8 +11,8 @@
 #include <cstdint>
 #include <curl/curl.h>
 #include <fcitx-utils/event.h>
+#include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/intrusivelist.h>
-#include <fcitx-utils/unixfd.h>
 #include <iterator>
 #include <mutex>
 #include <thread>
@@ -32,6 +20,8 @@
 #include <vector>
 #define MAX_HANDLE 100l
 #define MAX_BUFFER_SIZE 2048
+
+class CloudPinyin;
 
 class CurlQueue : public fcitx::IntrusiveListNode {
 public:
@@ -74,14 +64,16 @@ public:
     const std::vector<char> &result() { return data_; }
 
     CloudPinyinCallback callback() { return callback_; }
-    void setCallback(CloudPinyinCallback callback) { callback_ = callback; }
+    void setCallback(CloudPinyinCallback callback) {
+        callback_ = std::move(callback);
+    }
 
     int httpCode() const { return httpCode_; }
 
 private:
     static size_t curlWriteFunction(char *ptr, size_t size, size_t nmemb,
                                     void *userdata) {
-        auto self = static_cast<CurlQueue *>(userdata);
+        auto *self = static_cast<CurlQueue *>(userdata);
         return self->curlWrite(ptr, size, nmemb);
     }
 
@@ -95,8 +87,9 @@ private:
 
         if ((unsigned long long)((nmemb | size) & ((unsigned long long)SIZE_MAX
                                                    << (sizeof(size_t) << 2))) &&
-            (realsize / size != nmemb))
+            (realsize / size != nmemb)) {
             return 0;
+        }
 
         if (SIZE_MAX - data_.size() < realsize) {
             realsize = SIZE_MAX - data_.size();
@@ -126,10 +119,11 @@ typedef std::function<void(CurlQueue *)> SetupRequestCallback;
 
 class FetchThread {
 public:
-    FetchThread(fcitx::UnixFD notifyFd);
+    FetchThread(CloudPinyin *cloudPinyin);
     ~FetchThread();
 
-    bool addRequest(SetupRequestCallback);
+    // Call from main thread.
+    bool addRequest(const SetupRequestCallback &callback);
     CurlQueue *popFinished();
 
 private:
@@ -152,16 +146,18 @@ private:
 
     void run();
     void finished(CurlQueue *queue);
-    void quit();
 
+    // Call from main thread.
+    void exit();
+
+    CloudPinyin *cloudPinyin_;
     std::unique_ptr<std::thread> thread_;
     std::unique_ptr<fcitx::EventLoop> loop_;
+    fcitx::EventDispatcher dispatcher_;
     std::unordered_map<int, std::unique_ptr<fcitx::EventSourceIO>> events_;
     std::unique_ptr<fcitx::EventSourceTime> timer_;
 
     CURLM *curlm_;
-    fcitx::UnixFD selfPipeFd_[2];
-    fcitx::UnixFD notifyFd_;
 
     CurlQueue handles_[MAX_HANDLE];
     fcitx::IntrusiveList<CurlQueue> pendingQueue;
